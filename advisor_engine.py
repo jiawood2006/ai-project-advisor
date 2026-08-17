@@ -70,10 +70,10 @@ def get_db():
 # ---------- 意图识别（规则——不耗大模型） ----------
 INTENT_RULES = [
     ("payment_received", ["收到", "到账", "回款", "付款", "付了", "打了", "给了", "收款", "收了", "结款"]),
-    ("issue",           ["问题", "卡住", "延误", "没到", "还没到", "缺", "拖延", "出事了", "停工", "没来"]),
-    ("promise",         ["答应", "承诺", "说好", "保证", "同意", "确认", "没问题", "可以", "ok"]),
+    ("issue",           ["有问题", "出问题", "卡住", "延误", "没到", "还没到", "缺", "拖延", "出事了", "停工", "没来", "摔", "受伤", "事故", "流血", "砸"]),
+    ("change",          ["变更", "增项", "加钱", "追加", "改方案", "口头同意", "口头", "先干着"]),
+    ("promise",         ["答应", "承诺", "说好", "保证", "同意", "确认", "没问题", "可以", "ok", "后面好说", "到时候再说", "回头再说"]),
     ("signoff",         ["签证", "签认", "签字", "确认单", "联系单"]),
-    ("change",          ["变更", "增项", "加钱", "追加", "改方案"]),
     ("person_change",   ["换人", "离职", "走了", "调走", "换了", "辞职", "不干了"]),
     ("progress",        ["进度", "完成", "干了", "进场", "施工", "验收", "浇筑", "开工", "竣工"]),
     ("query",           ["什么情况", "怎么样", "多少钱", "几个项目", "查", "问一下", "看看", "汇报", "情况"]),
@@ -210,11 +210,14 @@ def _handle(db, msg, who, project_id, group_id):
     pid = proj["id"] if proj else project_id
     amount = extract_amount(msg)
 
-    # 命令词：诊断/周报 → 大模型生成
-    if any(k in msg for k in ["诊断", "分析一下", "帮我看看这个项目"]):
+    # 命令词：诊断/周报/复盘 → 大模型生成
+    if any(k in msg for k in ["诊断", "分析一下", "帮我看看这个项目", "亏了", "复盘", "哪里亏", "哪亏", "为什么亏"]):
         return llm_diagnose(pid)
     if any(k in msg for k in ["生成周报", "周报", "写周报", "出一份周报"]):
         return llm_report(pid)
+    # 全局查询（跨项目比较）
+    if any(k in msg for k in ["哪个项目", "所有项目", "全部项目", "最慢", "最快", "最危险", "对比"]):
+        return global_query(db, msg)
 
     intent = classify_intent(msg)
 
@@ -256,13 +259,56 @@ def _handle(db, msg, who, project_id, group_id):
         db.commit()
         return f"✅ 已记录收款 {amount/10000:.1f} 万。项目 {proj['name'] if proj else ''} 累计已收 {new_received/10000:.1f} 万（合同 {proj['contract']/10000:.1f} 万）。"
 
-    # 承诺 → 记录（带到期日解析）
+    # 变更 → 记录 + 提醒签证（口头变更=强提醒）
+    if intent == "change":
+        db.execute("INSERT INTO events (project_id,event_type,who,subject,amount,source) VALUES (?,?,?,?,?,?)",
+                   (pid, "change", who, msg[:50], amount, msg))
+        db.execute("INSERT INTO alerts (project_id,type,severity,content) VALUES (?,?,?,?)",
+                   (pid, "change", "critical" if any(k in msg for k in ["口头", "先干着", "先做", "先施工"]) else "warning",
+                    f"变更需补签证：{msg[:50]}"))
+        db.commit()
+        if any(k in msg for k in ["口头", "先干着", "先做", "先施工"]):
+            return ("🚨 **危险警告：口头变更未签证！**\n"
+                    "「先干着」= 已施工未签证——这是工程结算扯皮的头号原因。\n"
+                    "立即处理：\n"
+                    "1) 今天补签证单（联系单）让甲方签认\n"
+                    "2) 明确变更金额和计价方式\n"
+                    "3) 拍照留存施工前/后状态\n"
+                    "已记录该变更并加急预警。")
+        return (f"📝 变更已记录" + (f"（金额 {amount/10000:.1f} 万）" if amount else "") +
+                "。⚠️ 提醒：变更必须**书面签证**——口头不算数，建议立即补签证单。")
+
+    # 承诺 → 记录（模糊承诺追问）
     if intent == "promise":
         due = parse_due(msg)
         db.execute("INSERT INTO events (project_id,event_type,who,subject,due_date,source) VALUES (?,?,?,?,?,?)",
                    (pid, "promise", who, msg[:40], due, msg))
         db.commit()
+        if any(k in msg for k in ["后面好说", "到时候再说", "回头再说", "好说"]):
+            return ("📌 已记录模糊承诺（无时间/金额）。\n"
+                    "⚠️ 提醒：「后面好说」= 无法执行——建议现在追问：\n"
+                    "1) 具体什么时候付？\n"
+                    "2) 金额多少？\n"
+                    "3) 最好书面确认（微信文字/函件）——口头容易赖账")
         return f"📌 承诺已记录：{who} 说「{msg[:40]}」" + (f"，到期：{due}" if due else "") + "。到期我会提醒。"
+
+    # 问题/风险 → 记录 + 预警（安全事故升级）
+    if intent == "issue":
+        db.execute("INSERT INTO events (project_id,event_type,who,subject,source) VALUES (?,?,?,?,?)",
+                   (pid, "issue", who, msg[:60], msg))
+        db.execute("INSERT INTO alerts (project_id,type,severity,content) VALUES (?,?,?,?)",
+                   (pid, "issue", "critical" if any(k in msg for k in ["摔", "受伤", "事故", "流血", "砸"]) else "warning",
+                    f"{who} 报告问题：{msg[:60]}"))
+        db.commit()
+        if any(k in msg for k in ["摔", "受伤", "事故", "流血", "砸"]):
+            return ("🚨 **安全事故升级处理！**\n"
+                    "1) 立即：送医/急救——安全第一\n"
+                    "2) 上报：通知老板/安全员/甲方\n"
+                    "3) 现场：保护现场、拍照记录\n"
+                    "4) 停工排查：涉事区域暂停，查隐患\n"
+                    "5) 记录：伤情/时间/原因——后续保险/责任认定\n"
+                    "已记录并加急预警。")
+        return f"⚠️ 问题已记录并预警：「{msg[:50]}」——已通知相关人跟进。"
 
     # 进度 → 记录
     if intent == "progress":
@@ -270,25 +316,6 @@ def _handle(db, msg, who, project_id, group_id):
                    (pid, "progress", who, msg[:60], msg))
         db.commit()
         return f"✅ 进度已记录：「{msg[:50]}」——已存入 {proj['name'] if proj else ''} 项目档案。"
-
-    # 问题/风险 → 记录 + 预警
-    if intent == "issue":
-        db.execute("INSERT INTO events (project_id,event_type,who,subject,source) VALUES (?,?,?,?,?)",
-                   (pid, "issue", who, msg[:60], msg))
-        db.execute("INSERT INTO alerts (project_id,type,severity,content) VALUES (?,?,?,?)",
-                   (pid, "issue", "warning", f"{who} 报告问题：{msg[:60]}"))
-        db.commit()
-        return f"⚠️ 问题已记录并预警：「{msg[:50]}」——已通知相关人跟进。"
-
-    # 变更 → 记录 + 提醒签证
-    if intent == "change":
-        db.execute("INSERT INTO events (project_id,event_type,who,subject,amount,source) VALUES (?,?,?,?,?,?)",
-                   (pid, "change", who, msg[:50], amount, msg))
-        db.execute("INSERT INTO alerts (project_id,type,severity,content) VALUES (?,?,?,?)",
-                   (pid, "change", "warning", f"变更需补签证：{msg[:50]}"))
-        db.commit()
-        return (f"📝 变更已记录" + (f"（金额 {amount/10000:.1f} 万）" if amount else "") +
-                "。⚠️ 提醒：变更必须**书面签证**——口头不算数，建议立即补签证单。")
 
     # 其他 → 记录
     db.execute("INSERT INTO events (project_id,event_type,who,subject,source) VALUES (?,?,?,?,?)",
@@ -385,6 +412,24 @@ def llm_report(pid):
         return "⚠️ 还没有项目——先报一个"
     resp = advisor_llm.generate_report(proj, events)
     return resp if resp else "⚠️ 周报生成失败（大模型无响应）"
+
+def global_query(db, msg):
+    """全局查询（跨项目比较）"""
+    rows = [dict(r) for r in db.execute("SELECT * FROM projects WHERE status='active'")]
+    if not rows:
+        return "⚠️ 还没有项目——先新建一个"
+    if "回款" in msg or "收款" in msg or "慢" in msg:
+        rows.sort(key=lambda p: ((p["received"] or 0) / p["contract"]) if p["contract"] else 1)
+        lines = ["📊 项目回款排名（最慢 → 最快）："]
+        for p in rows:
+            rate = (p["received"] or 0) / p["contract"] * 100 if p["contract"] else 0
+            lines.append(f"  {p['name']}: 已收 {(p['received'] or 0)/10000:.1f} 万（{rate:.0f}%）")
+        return "\n".join(lines)
+    lines = ["📊 所有项目："]
+    for p in rows:
+        rate = (p["received"] or 0) / p["contract"] * 100 if p["contract"] else 0
+        lines.append(f"  {p['name']}: 合同 {p['contract']/10000:.1f} 万｜已收 {(p['received'] or 0)/10000:.1f} 万（{rate:.0f}%）")
+    return "\n".join(lines)
 
 def daily_check():
     """每日自动巡检：逾期应收/承诺到期/风险——生成预警（主动推送内容）"""
