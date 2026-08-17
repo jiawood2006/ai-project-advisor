@@ -1,3 +1,43 @@
+## English Introduction
+
+**AI Project Advisor** is a WeChat-based AI assistant for construction / engineering / building projects. It helps project owners and managers run projects by just chatting in WeChat groups — no software to learn, no forms to fill.
+
+### Key Features
+
+- **Memory Graph (Chat = Archive)**: Every word in your project group is archived automatically — promises, confirmations, payments, changes — with who/when/original message, ready as evidence for payment collection and dispute resolution
+- **Multi-Group Support**: One project per group (WeChat Work group), auto-binding group ↔ project, no data interference between projects; boss chat = global view
+- **Rule + LLM Hybrid Engine**: Daily recording costs zero tokens (rule-based intent recognition); complex understanding / deep diagnosis / report generation use LLM on demand (DeepSeek — cheap)
+- **Risk Radar**: Litigation / key personnel changes / supplier failures — proactive alerts + action checklists (auto web-scan is a paid-tier feature)
+- **8 Advisor Modules**: Progress / Payment / Change / Documentation / Risk / Inspection / Review / Training
+- **Proactive Service**: Daily morning brief, deadline countdown, anomaly detection (overdue payments, missing materials, schedule slippage), one-click reports, voice/photo input
+
+### Quick Start
+
+```bash
+# Python 3 + optional DEEPSEEK_API_KEY (in ~/.hermes/.env or env var)
+python3 advisor_engine.py   # multi-group demo
+python3 advisor_llm.py      # LLM enhancement test (diagnosis/report)
+```
+
+### Architecture
+
+```
+Chat (WeChat Work group)
+  → Rule engine (intent recognition — 0 token)
+  → Memory graph (SQLite: projects/events/group_bindings...)
+  → LLM layer (DeepSeek: complex parsing/diagnosis/reports — on demand)
+  → Proactive push (morning brief / alerts / reminders)
+```
+
+### Free vs Paid
+
+- Free: 3 project groups + recording/reminders + limited daily Q&A
+- Paid: more groups + deep diagnosis / reports / risk radar auto-scan
+
+MIT License. Star & share if useful!
+
+---
+
 # 🏗️ 工程项目 AI 顾问（AI Project Advisor）
 
 微信对话式工程项目管理助手——**老板不用管项目，AI 替他管**：发现问题、给出方案、自动干活。
