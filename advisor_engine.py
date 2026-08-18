@@ -58,6 +58,25 @@ CREATE TABLE IF NOT EXISTS group_bindings (
   binding_type TEXT DEFAULT 'project',  -- project/boss
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
+CREATE TABLE IF NOT EXISTS project_docs (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER,
+  doc_name TEXT,                  -- 资料名（合同/图纸/付款节点...）
+  doc_type TEXT DEFAULT 'base',   -- base(基础)/node(节点)
+  status TEXT DEFAULT 'missing',  -- missing/provided
+  required_by TEXT,               -- 要求时间（阶段）
+  provided_at TEXT,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE TABLE IF NOT EXISTS project_milestones (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER,
+  stage TEXT,                     -- 阶段名
+  plan_date TEXT,                 -- 计划日期
+  status TEXT DEFAULT 'pending',  -- pending/done/overdue
+  note TEXT,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
 """
 
 def get_db():
@@ -65,6 +84,15 @@ def get_db():
     db = sqlite3.connect(DB_PATH, timeout=15)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    # 兼容旧库：补引导字段
+    try:
+        db.execute("ALTER TABLE project_docs ADD COLUMN guide_order INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        db.execute("ALTER TABLE project_docs ADD COLUMN guide_done INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     return db
 
 # ---------- 意图识别（规则——不耗大模型） ----------
@@ -167,15 +195,98 @@ def create_project(db, msg, group_id):
     pid = cur.lastrowid
     if group_id:
         db.execute("INSERT OR REPLACE INTO group_bindings (group_id, project_id) VALUES (?,?)", (group_id, pid))
-    db.commit()
+    # 引导式建档（6 步——guide_order 顺序）
+    for i, doc in enumerate(ONBOARDING_DOCS, 1):
+        db.execute("INSERT INTO project_docs (project_id, doc_name, doc_type, required_by, guide_order, guide_done) VALUES (?,?,?,?,?,?)",
+                   (pid, doc, "base", "项目启动", i, 1 if (i == 3 and months) else 0))
     resp = f"✅ 项目已创建：「{name}」合同 {contract/10000:.1f} 万"
     if received:
         resp += f"，已收 {received/10000:.1f} 万"
     resp += "。"
     if months:
         resp += f"工期 {months} 个月。"
-    resp += "\n群里说的自动记录——有进度/回款/问题随时说。"
+        ms = generate_milestones(db, pid, float(months))
+        resp += f"\n\n📅 **已生成节点计划**（按 {months} 个月）：\n"
+        resp += "\n".join(f"· {s}：{d}" for s, d in ms)
+        resp += "\n（发「节点：完成 施工实施」更新状态）"
+    else:
+        resp += "\n\n⚠️ 缺少工期计划——节点无法确认（建档第 3 步可补）。"
+    db.commit()
+    resp += "\n\n🎯 **开始基础资料建档**（我一步步引导，答一步走一步）：\n"
+    resp += onboarding_next(db, pid)
     return resp
+
+# ---------- 引导建档 ----------
+ONBOARDING_HINTS = {
+    1: "发文件，或说：合同80万，月结",
+    2: "发文件即可（施工图/效果图/节点图）",
+    3: "如：工期3个月（我会自动生成节点计划）",
+    4: "如：首款30%，进度款按月，尾款10%",
+    5: "如：XX建材、XX施工队",
+    6: "如：负责人王经理，甲方对接人李工",
+}
+ONBOARDING_DOCS = ["合同/中标通知书", "施工图纸", "工期计划/节点", "付款节点（比例%）", "供应商/施工队名单", "负责人/对接人"]
+
+def match_onboarding(msg):
+    """把客户回复匹配到建档步骤"""
+    if any(k in msg for k in ["工期", "个月"]):
+        return 3
+    if any(k in msg for k in ["合同", "中标"]):
+        return 1
+    if any(k in msg for k in ["图纸"]):
+        return 2
+    if any(k in msg for k in ["付款", "首款", "进度款", "尾款", "%", "％"]):
+        return 4
+    if any(k in msg for k in ["供应商", "施工队", "材料商", "劳务"]):
+        return 5
+    if any(k in msg for k in ["负责人", "对接人", "经理"]):
+        return 6
+    return None
+
+def onboarding_status(db, pid):
+    """建档进度"""
+    if not pid:
+        return "⚠️ 请先在项目群里操作"
+    rows = [dict(r) for r in db.execute("SELECT * FROM project_docs WHERE project_id=? AND doc_type='base' ORDER BY guide_order", (pid,))]
+    if not rows:
+        return "该项目没有建档任务"
+    done = sum(1 for r in rows if r.get("guide_done"))
+    lines = [f"🎯 基础资料建档进度（{done}/{len(rows)}）："]
+    for r in rows:
+        mark = "✅" if r.get("guide_done") else "⏳"
+        lines.append(f"  {mark} {r['doc_name']}")
+    if done < len(rows):
+        nxt = next((r for r in rows if not r.get("guide_done")), None)
+        if nxt:
+            lines.append(f"\n下一步：第 {nxt['guide_order']} 步【{nxt['doc_name']}】——{ONBOARDING_HINTS.get(nxt['guide_order'], '')}")
+    else:
+        lines.append("\n🎉 基础资料建档完成！项目已全面受管——之后正常干活说话即可。")
+    return "\n".join(lines)
+
+def onboarding_next(db, pid):
+    """引导下一步"""
+    nxt = db.execute("SELECT * FROM project_docs WHERE project_id=? AND doc_type='base' AND guide_done=0 ORDER BY guide_order LIMIT 1", (pid,)).fetchone()
+    if not nxt:
+        return "🎉 **基础资料建档完成！**\n项目已全面受管：节点提醒/回款跟踪/资料要求/风险预警全部就绪。\n之后正常干活说话即可——AI 自动记录。"
+    return (f"**第 {nxt['guide_order']} 步**：请提供【{nxt['doc_name']}】——"
+            f"{ONBOARDING_HINTS.get(nxt['guide_order'], '')}\n（发「建档」随时查看进度）")
+
+def onboarding_complete_step(db, msg, pid, step_no):
+    """完成建档某步并引导下一步"""
+    doc = db.execute("SELECT * FROM project_docs WHERE project_id=? AND guide_order=?", (pid, step_no)).fetchone()
+    if not doc:
+        return onboarding_next(db, pid)
+    db.execute("UPDATE project_docs SET guide_done=1, status='provided', provided_at=datetime('now','localtime') WHERE id=?",
+               (doc["id"],))
+    extra = ""
+    if step_no == 3:
+        m = re.search(r'(\d+(?:\.\d+)?)\s*个月', msg)
+        if m:
+            db.execute("DELETE FROM project_milestones WHERE project_id=?", (pid,))
+            ms = generate_milestones(db, pid, float(m.group(1)))
+            extra = "\n📅 节点计划已生成：\n" + "\n".join(f"· {s}：{d}" for s, d in ms)
+    db.commit()
+    return f"✅ 【{doc['doc_name']}】已确认。{extra}\n\n下一步：\n" + onboarding_next(db, pid)
 
 def handle_message(msg, who="老板", project_id=None, group_id=None):
     """处理一条消息（支持多群）：群ID → 绑定项目 → 记录/响应"""
@@ -204,6 +315,36 @@ def _handle(db, msg, who, project_id, group_id):
         return ("📌 这是新项目群——先绑定项目才能记录：\n"
                 "· 绑定现有项目：「绑定项目：项目名」\n"
                 "· 创建新项目：「新建项目：XXX，合同80万，工期3个月，负责人王经理」")
+
+    # ---- 资料清单命令 ----
+    if ("资料" in msg) and ("提供资料" in msg):
+        return provide_doc(db, msg, project_id)
+    if ("资料" in msg) and any(k in msg for k in ["缺", "还差", "清单", "要求", "要提供"]):
+        return docs_status(db, project_id)
+    if msg.strip() in ("资料", "什么资料", "要什么资料"):
+        return docs_status(db, project_id)
+    # ---- 节点命令 ----
+    if "节点" in msg and any(k in msg for k in ["查", "看", "状态", "计划", "清单", "进度"]):
+        return milestones_status(db, project_id)
+    if "节点：完成" in msg or "节点:完成" in msg:
+        return milestone_done(db, msg, project_id)
+    if "工期" in msg and "个月" in msg:
+        return add_milestones(db, msg, project_id)
+    # ---- 建档命令 ----
+    if "建档" in msg:
+        return onboarding_status(db, project_id)
+    # ---- 引导模式（建档未完成——把回复匹配到步骤）----
+    if project_id:
+        pending = db.execute("SELECT * FROM project_docs WHERE project_id=? AND doc_type='base' AND guide_done=0 ORDER BY guide_order LIMIT 1", (project_id,)).fetchone()
+        if pending:
+            step_no = match_onboarding(msg)
+            if step_no:
+                return onboarding_complete_step(db, msg, project_id, step_no)
+            if ("提供资料" in msg) or ("已提供" in msg):
+                return provide_doc(db, msg, project_id)
+            return (f"📋 建档进行中——当前：**第 {pending['guide_order']} 步**【{pending['doc_name']}】\n"
+                    f"{ONBOARDING_HINTS.get(pending['guide_order'], '')}\n"
+                    f"（发「建档」查看进度）")
 
     projects = [dict(r) for r in db.execute("SELECT * FROM projects WHERE status='active'")]
     proj = extract_project(msg, projects, project_id)
@@ -412,6 +553,118 @@ def llm_report(pid):
         return "⚠️ 还没有项目——先报一个"
     resp = advisor_llm.generate_report(proj, events)
     return resp if resp else "⚠️ 周报生成失败（大模型无响应）"
+
+def generate_milestones(db, pid, months, start_date=None):
+    """按工期生成默认节点计划（阶段比例）"""
+    from datetime import datetime as dt, timedelta as td
+    start = dt.strptime(start_date, "%Y-%m-%d") if start_date else dt.now()
+    total_days = int(months * 30)
+    stages = [
+        ("设计/预算确认", 0.15),
+        ("材料采购", 0.20),
+        ("施工实施", 0.55),
+        ("验收交付", 0.08),
+        ("售后/结算", 0.02),
+    ]
+    rows = []
+    offset = 0
+    for name, ratio in stages:
+        offset += ratio
+        plan = (start + td(days=int(total_days * offset))).strftime("%Y-%m-%d")
+        db.execute("INSERT INTO project_milestones (project_id, stage, plan_date) VALUES (?,?,?)", (pid, name, plan))
+        rows.append((name, plan))
+    return rows
+
+def milestones_status(db, pid):
+    """节点计划状态"""
+    if not pid:
+        return "⚠️ 请先在项目群里操作"
+    rows = [dict(r) for r in db.execute("SELECT * FROM project_milestones WHERE project_id=? ORDER BY plan_date", (pid,))]
+    if not rows:
+        return "⚠️ 还没有节点计划——请提供工期（如「工期3个月」）——否则顾问无法按节点提醒"
+    today = datetime.now().strftime("%Y-%m-%d")
+    lines = ["📅 项目节点计划："]
+    for r in rows:
+        if r["status"] == "done":
+            mark = "✅"
+        elif r["status"] == "overdue" or (r["status"] == "pending" and r["plan_date"] < today):
+            mark = "🚨"
+        else:
+            mark = "⏳"
+        over = "（已逾期！）" if mark == "🚨" else ""
+        lines.append(f"  {mark} {r['stage']}：{r['plan_date']}{over}")
+    lines.append("（发「节点：完成 施工实施」更新）")
+    return "\n".join(lines)
+
+def add_milestones(db, msg, pid):
+    """补充工期 → 生成节点计划"""
+    if not pid:
+        return "⚠️ 请先在项目群里操作"
+    m = re.search(r'工期[：:]?\s*(\d+(?:\.\d+)?)\s*个月', msg)
+    if not m:
+        return "⚠️ 请提供工期：如「工期3个月」"
+    db.execute("DELETE FROM project_milestones WHERE project_id=?", (pid,))
+    rows = generate_milestones(db, pid, float(m.group(1)))
+    db.execute("UPDATE project_docs SET status='provided', provided_at=datetime('now','localtime') WHERE project_id=? AND doc_name LIKE '%工期%'", (pid,))
+    db.execute("UPDATE project_docs SET guide_done=1 WHERE project_id=? AND guide_order=3", (pid,))
+    db.commit()
+    return "📅 节点计划已生成（按工期 %s 个月）：\n" % m.group(1) + "\n".join(f"· {s}：{d}" for s, d in rows)
+
+def milestone_done(db, msg, pid):
+    """标记节点完成：节点：完成 施工实施"""
+    if not pid:
+        return "⚠️ 请先在项目群里操作"
+    m = re.search(r'(?:节点[：:]\s*完成\s*|完成\s*)(.+)', msg)
+    name = m.group(1).strip()[:20] if m else ""
+    if not name:
+        return "⚠️ 用法：节点：完成 施工实施"
+    row = db.execute("SELECT * FROM project_milestones WHERE project_id=? AND stage LIKE ?", (pid, f"%{name}%")).fetchone()
+    if not row:
+        return f"⚠️ 找不到节点「{name}」——发「节点计划」查看"
+    db.execute("UPDATE project_milestones SET status='done' WHERE id=?", (row["id"],))
+    db.commit()
+    return f"✅ 节点「{row['stage']}」已完成。\n" + milestones_status(db, pid)
+
+def docs_status(db, pid):
+    """资料清单状态——顾问要求/缺口查询"""
+    if not pid:
+        return "⚠️ 请先在项目群里操作"
+    rows = [dict(r) for r in db.execute("SELECT * FROM project_docs WHERE project_id=? ORDER BY id", (pid,))]
+    if not rows:
+        return "📋 该项目暂无资料要求清单"
+    provided = [r for r in rows if r["status"] == "provided"]
+    missing = [r for r in rows if r["status"] == "missing"]
+    lines = [f"📋 项目资料清单（已提供 {len(provided)}/{len(rows)}）："]
+    for r in rows:
+        mark = "✅" if r["status"] == "provided" else "⏳"
+        req = f"（{r['required_by']}）" if r.get("required_by") else ""
+        lines.append(f"  {mark} {r['doc_name']}{req}")
+    if missing:
+        lines.append("\n⏳ 还缺：" + "、".join(r["doc_name"] for r in missing))
+        lines.append("发「提供资料：合同」标记已提供（或直接发文件）")
+    return "\n".join(lines)
+
+def provide_doc(db, msg, pid):
+    """标记资料已提供"""
+    if not pid:
+        return "⚠️ 请先在项目群里操作"
+    m = re.search(r'(?:提供资料|已提供|补上)[：: ]*\s*(.+)', msg)
+    name = m.group(1).strip()[:30] if m else msg.strip()[:30]
+    rows = [dict(r) for r in db.execute("SELECT * FROM project_docs WHERE project_id=? AND status='missing'", (pid,))]
+    matched = None
+    for r in rows:
+        if r["doc_name"] in name or name in r["doc_name"] or r["doc_name"][:2] in name:
+            matched = r
+            break
+    if matched:
+        db.execute("UPDATE project_docs SET status='provided', provided_at=datetime('now','localtime') WHERE id=?",
+                   (matched["id"],))
+        db.commit()
+        return f"✅ 已记录「{matched['doc_name']}」已提供。\n" + docs_status(db, pid)
+    db.execute("INSERT INTO project_docs (project_id, doc_name, status, provided_at) VALUES (?,?,?,datetime('now','localtime'))",
+               (pid, name, "provided"))
+    db.commit()
+    return f"✅ 已记录「{name}」已提供。\n" + docs_status(db, pid)
 
 def global_query(db, msg):
     """全局查询（跨项目比较）"""
