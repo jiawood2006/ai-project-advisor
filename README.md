@@ -19,6 +19,12 @@ python3 advisor_engine.py   # multi-group demo
 python3 advisor_llm.py      # LLM enhancement test (diagnosis/report)
 ```
 
+### New in latest version
+
+- **Guided Onboarding (引导性建档)**: AI walks the client through 6-step base-doc setup one step at a time — answer one, next step appears
+- **Milestone Plan (节点计划)**: give a duration (工期3个月) and AI auto-generates a 5-stage milestone schedule, tracks overdue, one-command status updates
+- **Doc Requirements (顾问要求资料)**: advisor actively asks for required docs (contract/drawings/payment terms), tracks provided/missing status
+
 ### Architecture
 
 ```
