@@ -79,8 +79,37 @@ CREATE TABLE IF NOT EXISTS project_milestones (
   stage TEXT,                     -- 阶段名
   plan_date TEXT,                 -- 计划日期
   status TEXT DEFAULT 'pending',  -- pending/done/overdue
-  note TEXT,
-  created_at TEXT DEFAULT (datetime('now','localtime'))
+  note TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS payment_schedule (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER,
+  stage TEXT,                     -- 付款节点：预付款/进度款/结算款/质保金
+  ratio REAL,                     -- 比例（0-1）
+  amount REAL,                    -- 金额（元）
+  due_date TEXT,                  -- 应到日期
+  status TEXT DEFAULT 'pending',  -- pending/paid/overdue
+  paid_date TEXT DEFAULT NULL
+);
+CREATE TABLE IF NOT EXISTS visa_records (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER,
+  title TEXT,                     -- 变更/签证内容
+  amount REAL,                    -- 金额（元）
+  status TEXT DEFAULT 'pending',  -- pending(口头未签)/signed/paid
+  note TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS material_ledger (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER,
+  name TEXT,                      -- 材料名
+  brand TEXT,                     -- 品牌
+  spec TEXT,                      -- 规格
+  qty REAL DEFAULT 0,
+  unit TEXT DEFAULT '',
+  price REAL DEFAULT 0,           -- 单价
+  arrived INTEGER DEFAULT 0,      -- 0未到/1已到
+  note TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS resources (
   id INTEGER PRIMARY KEY,
@@ -107,6 +136,19 @@ def get_db():
     # 兼容旧库：补引导字段
     try:
         db.execute("ALTER TABLE project_docs ADD COLUMN guide_order INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    # 兼容旧库：签证/材料台账补时间列
+    try:
+        db.execute("ALTER TABLE visa_records ADD COLUMN created_at TEXT DEFAULT (datetime('now','localtime'))")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        db.execute("ALTER TABLE material_ledger ADD COLUMN created_at TEXT DEFAULT (datetime('now','localtime'))")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        db.execute("ALTER TABLE projects ADD COLUMN ptype TEXT")
     except sqlite3.OperationalError:
         pass
     try:
@@ -213,6 +255,9 @@ def create_project(db, msg, group_id):
     cur = db.execute("INSERT INTO projects (name,contract,received,manager,stage) VALUES (?,?,?,?,?)",
                      (name, contract, received, manager, "启动"))
     pid = cur.lastrowid
+    ptype = infer_ptype(name)
+    if ptype:
+        db.execute("UPDATE projects SET ptype=? WHERE id=?", (ptype, pid))
     if group_id:
         db.execute("INSERT OR REPLACE INTO group_bindings (group_id, project_id) VALUES (?,?)", (group_id, pid))
     # 引导式建档（6 步——guide_order 顺序）
@@ -225,8 +270,8 @@ def create_project(db, msg, group_id):
     resp += "。"
     if months:
         resp += f"工期 {months} 个月。"
-        ms = generate_milestones(db, pid, float(months))
-        resp += f"\n\n📅 **已生成节点计划**（按 {months} 个月）：\n"
+        ms = generate_milestones(db, pid, float(months), ptype=ptype)
+        resp += f"\n\n📅 **已生成节点计划**（按 {months} 个月" + (f"，检测到**{ptype}工程**流程" if ptype else "") + "）：\n"
         resp += "\n".join(f"· {s}：{d}" for s, d in ms)
         resp += "\n（发「节点：完成 施工实施」更新状态）"
     else:
@@ -304,7 +349,10 @@ def onboarding_complete_step(db, msg, pid, step_no):
         if m:
             db.execute("DELETE FROM project_milestones WHERE project_id=?", (pid,))
             ms = generate_milestones(db, pid, float(m.group(1)))
-            extra = "\n📅 节点计划已生成：\n" + "\n".join(f"· {s}：{d}" for s, d in ms)
+            extra = "📅 节点计划已生成：" + "，".join(f"{n} {d}" for n, d in ms[:3]) + "..."
+    if step_no == 4:
+        # 付款节点（比例%）→ 生成回款计划表
+        extra = build_payment_schedule(db, pid, msg)
     db.commit()
     return f"✅ 【{doc['doc_name']}】已确认。{extra}\n\n下一步：\n" + onboarding_next(db, pid)
 
@@ -351,8 +399,8 @@ def _handle(db, msg, who, project_id, group_id):
         return docs_status(db, project_id)
     if msg.strip() in ("资料", "什么资料", "要什么资料"):
         return docs_status(db, project_id)
-    # ---- 节点命令 ----
-    if "节点" in msg and any(k in msg for k in ["查", "看", "状态", "计划", "清单", "进度"]):
+    # ---- 节点命令（排除"付款节点"——那是建档步骤4的付款条款，不能当节点计划查询）----
+    if "节点" in msg and any(k in msg for k in ["查", "看", "状态", "计划", "清单", "进度"]) and not any(k in msg for k in ["付款", "支付"]):
         return milestones_status(db, project_id)
     if "节点：完成" in msg or "节点:完成" in msg:
         return milestone_done(db, msg, project_id)
@@ -365,6 +413,12 @@ def _handle(db, msg, who, project_id, group_id):
     if any(k in msg for k in ["回忆", "查一下当时", "之前说过", "谁说的", "原话"]):
         return memory_recall(db, project_id, msg)
 
+    # ---- ② 签证台账 / ③ 材料台账：登记/查询/更新（提前于顾问与建档——建档中也可用）----
+    if (msg.startswith("签证：") or msg.startswith("签证:")) or any(k in msg for k in ["签证清单", "签证记录", "签证台账", "签证状态"]):
+        return visa_cmd(db, msg, project_id)
+    if (msg.startswith("材料：") or msg.startswith("材料:")) or any(k in msg for k in ["材料清单", "材料台账", "材料到货", "材料进场", "材料记录", "材料明细"]):
+        return material_cmd(db, msg, project_id)
+
     # ---- ⑦ 资源方管理：登记/到货/缺货/查询（提前于建档拦截）----
     if msg.startswith("材料商") or msg.startswith("施工队") or msg.startswith("分包商"):
         return resource_cmd(db, msg, project_id)
@@ -374,10 +428,65 @@ def _handle(db, msg, who, project_id, group_id):
         return llm_advisor(project_id, "风险", msg)
     if any(k in msg for k in ["进度分析", "进度怎么样", "进度如何", "会不会延期", "进度顾问"]):
         return llm_advisor(project_id, "进度", msg)
-    if any(k in msg for k in ["回款分析", "回款情况", "回款顾问", "催款", "应收", "收了多少"]):
+    if any(k in msg for k in ["回款分析", "回款情况", "回款顾问", "催款", "应收", "收了多少", "回款周期", "回款时间", "回款多久", "什么时候回款", "回款进度"]):
         return llm_advisor(project_id, "回款", msg)
     if any(k in msg for k in ["盈利预测", "能赚多少", "利润", "现金流", "资金缺口", "接单评估", "这个单能接吗"]):
         return llm_biz(project_id, msg)
+    # ⑤ 行业知识库：类别清单（精确命令提前——建档中也能查）
+    if msg.strip() in ("知识库", "行业知识", "有什么知识", "知识库有哪些"):
+        return kb_list()
+
+    # ---- 建档中：资料匹配优先（合同/图纸/工期等建档步骤不能被 LLM 吞掉）----
+    if project_id:
+        _pending = db.execute("SELECT * FROM project_docs WHERE project_id=? AND doc_type='base' AND guide_done=0 ORDER BY guide_order LIMIT 1", (project_id,)).fetchone()
+        if _pending:
+            _step_no = match_onboarding(msg)
+            if _step_no:
+                return onboarding_complete_step(db, msg, project_id, _step_no)
+            if ("提供资料" in msg) or ("已提供" in msg):
+                return provide_doc(db, msg, project_id)
+
+    # ---- LLM 智能理解优先（核心：自由对话，不被框架限制）----
+    # 一次调用：判断意图 + 直接生成回答；命令类分发到专业模块
+    if LLM_AVAILABLE and project_id:
+        try:
+            import advisor_llm
+            _p = dict(db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone() or {})
+            _ev = db.execute("SELECT event_type,subject,amount,due_date FROM events WHERE project_id=? ORDER BY id DESC LIMIT 10", (project_id,)).fetchall()
+            _ev_txt = "\n".join(f"- [{e['event_type']}]{e['subject']}" + (f"（{e['amount']/10000:.1f}万）" if e['amount'] else "") + (f" 应到{e['due_date']}" if e['due_date'] else "") for e in _ev) or "（暂无记录）"
+            _ms = db.execute("SELECT stage,plan_date,status FROM project_milestones WHERE project_id=? ORDER BY plan_date", (project_id,)).fetchall()
+            _ms_txt = "\n".join(f"- {m['stage']} {m['plan_date']}（{m['status']}）" for m in _ms) or "（暂无节点）"
+            _ct = db.execute("SELECT source FROM events WHERE project_id=? AND event_type='contract' ORDER BY id DESC LIMIT 1", (project_id,)).fetchone()
+            _ct_txt = (_ct["source"][:1200] if _ct and _ct["source"] else "（无合同文本——客户可发合同文件）")
+            kb = kb_search(msg, limit=2)
+            kb_txt = "\n".join(f"- [{c}]{t}：{content[:150]}" for _, c, t, content in kb) if kb else "（无匹配知识）"
+            sys_p = f"""你是资深工程项目顾问（20年经验），服务客户「{_p.get('name','本项目')}」。项目数据：合同 {(_p.get('contract') or 0)/10000:.1f} 万，已收 {(_p.get('received') or 0)/10000:.1f} 万。
+【合同文本】（必须基于此回答，引用具体条款/金额/日期）：
+{_ct_txt}
+项目记录：{_ev_txt}
+节点计划：{_ms_txt}
+行业知识（相关时引用并注明出处）：
+{kb_txt}
+客户发来消息。请【基于合同文本和项目数据正面回答】，规则：
+- 【禁止编造】只能引用上方提供的数据（合同/记录/节点），没有的信息不能说"有"，不知道就明说不知道
+- 必须引用合同里的具体条款/金额/日期/甲方信息，禁止说套话空话
+- 数据不足时明说"合同未体现XX/记录中没有XX"，并给出建议怎么确认
+- 报告事实（收款/变更/问题）→ 确认 + 关键提醒（如变更要签证）
+- 回答像真顾问，直接给结论。只输出回答正文。"""
+            resp = advisor_llm.chat([{"role": "system", "content": sys_p}, {"role": "user", "content": msg}], temperature=0.3, max_tokens=500)
+            if resp and not resp.startswith("__LLM_ERROR__"):
+                # 业务事实尽量落库
+                _biz = classify_intent(msg)
+                if _biz != "record":
+                    try:
+                        db.execute("INSERT INTO events (project_id,event_type,who,subject,source) VALUES (?,?,?,?,?)",
+                                   (project_id, _biz, who, msg[:60], msg))
+                        db.commit()
+                    except Exception:
+                        pass
+                return resp
+        except Exception:
+            pass
 
     # ---- 业务消息优先：建档引导不拦截收款/承诺/变更/问题/进度等 ----
     _biz_intent = classify_intent(msg)
@@ -396,8 +505,16 @@ def _handle(db, msg, who, project_id, group_id):
                 import advisor_llm
                 pname = db.execute("SELECT name FROM projects WHERE id=?", (project_id,)).fetchone()
                 pname = pname["name"] if pname else "本项目"
-                sys_p = f"你是资深工程项目顾问，服务客户「{pname}」。客户正在建档但随时会问问题。请：1) 优先认真回答客户的问题（风险/进度/施工/管理均可），像真顾问一样给出专业分析和建议；2) 不要反复强调建档流程；3) 回答简洁专业。只需输出回答正文。"
-                resp = advisor_llm.chat([{"role": "system", "content": sys_p}, {"role": "user", "content": msg}], temperature=0.3, max_tokens=400)
+                # 带项目数据（合同/已收/应收/节点）——让回答有的放矢
+                _p = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+                _p = dict(_p) if _p else {}
+                _ev = db.execute("SELECT event_type,subject,amount,due_date FROM events WHERE project_id=? ORDER BY id DESC LIMIT 8", (project_id,)).fetchall()
+                _ev_txt = "\n".join(f"- [{e['event_type']}]{e['subject']}" + (f"（{e['amount']/10000:.1f}万）" if e['amount'] else "") + (f" 应到{e['due_date']}" if e['due_date'] else "") for e in _ev) or "（暂无记录）"
+                sys_p = f"""你是资深工程项目顾问，服务客户「{pname}」。项目数据：合同 {(_p.get('contract') or 0)/10000:.1f} 万，已收 {(_p.get('received') or 0)/10000:.1f} 万。
+项目记录：{_ev_txt}
+客户发来消息。请【必须正面回答客户的问题】——回款/进度/风险/施工问题都要给出明确答案（有数据用数据，没数据给判断方法）。
+回答要专业、直接、给结论。不要只回复"已记录"，不要反问建档。"""
+                resp = advisor_llm.chat([{"role": "system", "content": sys_p}, {"role": "user", "content": msg}], temperature=0.3, max_tokens=500)
                 if resp and not resp.startswith("__LLM_ERROR__"):
                     return f"💬 {resp}\n\n_（建档进行中：第 {pending['guide_order']} 步——发「建档」可查看进度）_"
             except Exception:
@@ -421,7 +538,7 @@ def _handle(db, msg, who, project_id, group_id):
         return llm_advisor(pid, "进度", msg)
     if any(k in msg for k in ["回款分析", "回款情况", "回款顾问", "催款", "应收", "收了多少"]):
         return llm_advisor(pid, "回款", msg)
-    if any(k in msg for k in ["变更分析", "变更顾问", "签证"]):
+    if any(k in msg for k in ["变更分析", "变更顾问"]):
         return llm_advisor(pid, "变更", msg)
     if any(k in msg for k in ["资料分析", "资料顾问", "资料全吗", "资料齐"]):
         return docs_status(db, project_id)
@@ -431,6 +548,11 @@ def _handle(db, msg, who, project_id, group_id):
         return llm_advisor(pid, "巡检", msg)
     if any(k in msg for k in ["新人", "怎么干", "流程规范", "新手", "培训"]):
         return llm_advisor(pid, "新人", msg)
+    # ② 签证台账 / ③ 材料台账（pid 版）
+    if (msg.startswith("签证：") or msg.startswith("签证:")) or any(k in msg for k in ["签证清单", "签证记录", "签证台账", "签证状态"]):
+        return visa_cmd(db, msg, pid)
+    if (msg.startswith("材料：") or msg.startswith("材料:")) or any(k in msg for k in ["材料清单", "材料台账", "材料到货", "材料进场", "材料记录", "材料明细"]):
+        return material_cmd(db, msg, pid)
     # ⑥ 风险登记（人工上报：风险：甲方被执行/供应商失信）
     if msg.startswith("风险：") or msg.startswith("风险:"):
         db.execute("INSERT INTO alerts (project_id,type,severity,content) VALUES (?,?,?,?)",
@@ -460,6 +582,12 @@ def _handle(db, msg, who, project_id, group_id):
     # 全局查询（跨项目比较）
     if any(k in msg for k in ["哪个项目", "所有项目", "全部项目", "最慢", "最快", "最危险", "对比"]):
         return global_query(db, msg)
+    # ⑤ 行业知识库：清单/直接问答（放顾问命令之后——不抢项目分析）
+    if msg.strip() in ("知识库", "行业知识", "有什么知识", "知识库有哪些"):
+        return kb_list()
+    _kb = kb_answer(msg)
+    if _kb:
+        return _kb
 
     intent = classify_intent(msg)
 
@@ -565,11 +693,15 @@ def _handle(db, msg, who, project_id, group_id):
             pname = proj["name"] if proj else (db.execute("SELECT name FROM projects WHERE id=?", (pid,)).fetchone() or {}).get("name") if pid else None
             recent = db.execute("SELECT subject, source FROM events WHERE project_id=? ORDER BY id DESC LIMIT 5", (pid,)).fetchall() if pid else []
             recent_txt = "\n".join(f"- {r['subject']}" for r in recent) if recent else "（暂无记录）"
+            kb = kb_search(msg, limit=2)
+            kb_txt = "\n".join(f"- [{c}]{t}：{content[:200]}" for _, c, t, content in kb) if kb else "（无匹配知识）"
             sys_p = (
                 "你是资深工程项目顾问，服务中小施工/装修公司。客户发来消息，请：\n"
-                "1) 自然回答客户（风险/进度/施工/管理/回款均可），像真顾问一样专业、简洁、给方法\n"
-                "2) 如果消息是业务事实（收款/付款/变更/承诺/问题/进度/人员变动），先在心里记住，回答末尾附一行：📌 已记录：<一句话概括>\n"
-                "3) 不要机械，不要反复引导建档。"
+                "1) 【必须正面回答】客户的问题——回款/进度/风险/施工/材料问题都给明确答案（有项目数据用数据，没数据给判断方法和经验值）\n"
+                "2) 回答要专业、直接、给结论，像真顾问聊天，不要只回复'已记录'\n"
+                "3) 如果消息确实是业务事实（收款/付款/变更/承诺/问题/进度），回答完在末尾附一行：📌 已记录：<一句话概括>\n"
+                "4) 不要机械，不要反复引导建档。\n"
+                f"5) 行业知识（若与客户问题相关，引用并注明出处）：\n{kb_txt}\n"
             )
             user_p = f"客户：{who}\n项目：{pname or '未指定'}\n最近记录：\n{recent_txt}\n\n客户说：{msg}"
             resp = advisor_llm.chat([{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}], temperature=0.3, max_tokens=500)
@@ -610,6 +742,8 @@ def llm_advisor(pid, module, msg):
             contract = db.execute("""SELECT source FROM events WHERE project_id=? AND event_type='contract'
                 ORDER BY id DESC LIMIT 1""", (pid,)).fetchone()
             contract_txt = (contract["source"][:1500] if contract and contract["source"] else "（未提供合同文本——可发合同文件让我分析条款）")
+            kb = kb_search(msg, limit=2)
+            kb_txt = "\n".join(f"- [{c}]{t}：{content[:150]}" for _, c, t, content in kb) if kb else "（无匹配知识）"
             prompt = f"""你是资深工程项目风险顾问（有 20 年工程纠纷处理经验）。项目「{p['name']}」：
 合同金额 {p['contract']/10000:.1f} 万，已收 {p['received']/10000:.1f} 万，阶段 {p['stage']}。
 合同文本：
@@ -618,6 +752,8 @@ def llm_advisor(pid, module, msg):
 {ev_txt}
 节点计划：
 {ms_txt}
+行业知识（相关时引用并注明出处）：
+{kb_txt}
 请做【专业风险评估】，按以下框架输出：
 一、合同风险：结合合同文本分析——付款条款是否有利、变更/签证条款、违约金/质保金比例、工期违约风险
 二、甲方风险：结合合同中的甲方信息（名称/法人/主体）分析——付款能力、是否有拖延迹象、人员变动、被诉/被执行风险
@@ -626,6 +762,21 @@ def llm_advisor(pid, module, msg):
 五、应对建议：3-5 条可执行措施（分 P0/P1 优先级）
 要求：结合合同具体条款和记录事实，不要空话，600字内。"""
         else:
+            # 回款顾问：读付款计划表（如有）
+            ps_txt = ""
+            if module == "回款":
+                ps = db.execute("SELECT stage,ratio,amount,due_date,status FROM payment_schedule WHERE project_id=? ORDER BY id", (pid,)).fetchall()
+                if ps:
+                    ps_txt = "\n".join(f"- {p['stage']}：{p['amount']/10000:.1f}万（{p['ratio']*100:.0f}%）应到{p['due_date']}，状态{p['status']}" for p in ps)
+                else:
+                    ps_txt = "（无回款计划——建档时提供付款条款可生成，如「付款节点：预付30%，进度款按月，质保金5%」）"
+            if module == "变更":
+                vs = db.execute("SELECT title,amount,status FROM visa_records WHERE project_id=? ORDER BY id DESC LIMIT 15", (pid,)).fetchall()
+                if vs:
+                    ps_txt = "\n".join(f"- {v['title']}" + (f"（{v['amount']/10000:.1f}万）" if v["amount"] else "") + f"【{'未签' if v['status']=='pending' else '已签' if v['status']=='signed' else '已付'}】" for v in vs)
+                    ps_txt = "签证台账：\n" + ps_txt + "\n"
+                else:
+                    ps_txt = "（签证台账为空——口头变更请发「签证：XX」登记）"
             # 各顾问模块专业框架
             frameworks = {
                 "进度": """你是资深进度顾问。请做进度分析：
@@ -652,11 +803,16 @@ def llm_advisor(pid, module, msg):
 请用大白话讲清楚：流程步骤、规范要点、常见坑、跟谁对接。分步说明，像师傅带徒弟。""",
             }
             fw = frameworks.get(module, "")
+            ps_block = ("回款计划：\n" + ps_txt + "\n") if ps_txt else ""
+            kb = kb_search(msg, limit=2)
+            kb_txt = "\n".join(f"- [{c}]{t}：{content[:150]}" for _, c, t, content in kb) if kb else "（无匹配知识）"
             prompt = f"""你是资深工程项目顾问。客户项目「{p['name']}」（合同 {p['contract']/10000:.1f} 万，已收 {p['received']/10000:.1f} 万）。
 节点计划：
 {ms_txt}
-项目记录：
+{ps_block}项目记录：
 {ev_txt}
+行业知识（相关时引用并注明出处）：
+{kb_txt}
 {fw}
 客户问（{module}顾问）：{msg}
 请按上述框架专业分析，结合记录事实，简洁专业，500字内。"""
@@ -669,6 +825,193 @@ def llm_advisor(pid, module, msg):
 
 
 # ---------- ⑥ 风险登记已接入 ----------
+# ---------- ⑤ 行业知识库（L1：规范/质保金/签证/纠纷——轻量关键词检索 + LLM 注入） ----------
+SEED_KB = [
+    # (category, title, keywords, content)
+    ("签证", "口头变更必须书面签证", "签证,口头变更,补签,联系单,签认,变更",
+     "变更/增项必须**书面签证**（签证单/联系单），甲方签字确认才有效——口头指令不算数。签证单要素：工程名称、变更内容、工程量、单价/金额、日期、双方签字盖章。口头干了活再补签是结算扯皮头号原因；补签不了就留证据（微信/照片/录音）。"),
+    ("回款", "工程款优先受偿权", "优先受偿,拍卖,折价,民法典807,受偿权,赖账,不给钱",
+     "《民法典》第807条：发包人未按约支付工程款，承包人催告后仍不支付的，可就工程折价或拍卖所得价款**优先受偿**（优先于抵押权和其他债权）。行使期限：自应当给付工程款之日起18个月内主张（司法解释一）。发现甲方资不抵债要尽快主张。"),
+    ("回款", "工程款诉讼时效3年", "诉讼时效,起诉,3年,过期,时效,欠款",
+     "《民法典》第188条：工程款债权诉讼时效**3年**，自知道或应当知道权利受损起算。催款（微信/函件/起诉）可中断时效重新起算——**每3年至少留一次书面催收记录**。"),
+    ("回款", "实际施工人可起诉发包人", "实际施工人,转包,违法分包,起诉,发包人,包工头",
+     "司法解释（一）第43条：转包/违法分包的实际施工人，可以起诉发包人，在**欠付工程款范围内**承担责任。挂靠/转包的包工头欠款有这条兜底。"),
+    ("质保金", "质保金比例上限3%", "质保金,保证金,3%,保函,缺陷责任期,质保",
+     "《建设工程质量保证金管理办法》（建质〔2017〕138号）：质保金总预留比例**不得高于工程结算总额的3%**，可用银行保函替代。缺陷责任期一般1-2年、最长不超2年，届满应返还；保修期按《建设工程质量管理条例》：防水工程5年、主体结构为设计使用年限。"),
+    ("工期", "工期顺延要及时发函", "工期顺延,延期,发函,窝工,索赔,停工",
+     "非承包人原因（甲方变更/付款延迟/不可抗力/图纸延误）→ 应**及时发函**主张工期顺延和费用索赔，逾期可能被视为放弃（合同有约定按约定）。停工/窝工损失要有书面记录。"),
+    ("验收", "隐蔽工程先验后隐", "隐蔽工程,验收,覆盖,剥露,通知,防水",
+     "《建设工程质量管理条例》：隐蔽工程隐蔽**前**须通知建设单位/监理检验，合格才能覆盖。未通知就隐蔽→甲方可要求剥露重验，费用由责任方承担。隐蔽前拍照+记录是基本操作。"),
+    ("验收", "竣工验收与结算视为认可", "竣工验收,视为认可,结算文件,答复,拖延,结算",
+     "工程完工后发包人应及时组织验收。**竣工结算文件**：合同里写清「发包人收到结算文件后X日内不答复视为认可」——这是对付'拖着不结算'的关键条款。"),
+    ("材料", "材料进场须报验", "材料进场,报验,合格证,检测报告,不合格,材料",
+     "材料进场须**报验**（合格证/检测报告/复试），不合格材料不得使用。先用了再主张不合格→风险自担。甲方供材延迟/不合格→可索赔工期和损失。"),
+    ("纠纷", "工程纠纷证据清单", "证据,纠纷,诉讼,证据保全,微信记录,聊天记录",
+     "工程纠纷核心证据：合同及补充协议、签证单、联系单、**微信/聊天记录**、现场照片、施工日志、验收单、付款凭证。关键证据缺失是败诉主因——日常就要留痕。"),
+    ("造价", "增项先谈价后施工", "增项,变更计价,谈价,定额,市场价,加钱",
+     "变更/增项**先谈价后施工**：无约定按合同计价方式，合同没约定→参照定额或市场价。先干活后谈价最被动。"),
+    ("造价", "垫资与利息", "垫资,利息,资金,垫付,回款慢",
+     "垫资：合同有约定按约定（利息受司法保护上限约束），无约定按实际垫资事实处理。垫资前写清归还时间和利息。"),
+]
+
+def kb_search(msg, limit=3):
+    """关键词检索行业知识库——命中 category/title/keywords"""
+    try:
+        rows = []
+        for item in SEED_KB:
+            cat, title, kws, content = item
+            hit = 0
+            for kw in (kws + "," + cat + "," + title).split(","):
+                kw = kw.strip()
+                if kw and kw in msg:
+                    hit += 1
+            if hit:
+                rows.append((hit, cat, title, content))
+        rows.sort(key=lambda x: -x[0])
+        return rows[:limit]
+    except Exception:
+        return []
+
+def kb_answer(msg):
+    """行业知识直接问答（强知识词命中→直接返回，省 token）"""
+    hits = kb_search(msg, limit=3)
+    if not hits:
+        return None
+    lines = ["📖 行业知识（供参考）："]
+    for _, cat, title, content in hits:
+        lines.append(f"\n**{title}**（{cat}）\n{content}")
+    lines.append("\n（发「知识库」查看全部类别）")
+    return "\n".join(lines)
+
+def kb_list():
+    cats = []
+    for item in SEED_KB:
+        if item[0] not in cats:
+            cats.append(item[0])
+    return "📚 行业知识库（L1 规范/标准/判例）类别：\n" + "\n".join(
+        f"- {c}（{sum(1 for i in SEED_KB if i[0]==c)}条）" for c in cats) + \
+        "\n\n问相关问题我自动引用出处（如：质保金比例、口头变更、诉讼时效、隐蔽工程）"
+
+
+# ---------- ② 签证台账（visa_records） ----------
+def visa_cmd(db, msg, pid):
+    """签证台账：登记 / 清单 / 状态更新（未签→已签→已付）"""
+    try:
+        if not pid:
+            return "⚠️ 还没有项目——先「新建项目：XXX，合同XX万，工期X个月」"
+        body = msg.split("：", 1)[-1].split(":", 1)[-1].strip() if ("：" in msg or ":" in msg) else msg
+        # 状态更新：签证：已签 XX / 签证：完成 XX / 签证：已付 XX
+        for kw, status, mark in [("已签", "signed", "✅ 已签"), ("完成", "signed", "✅ 已签"), ("已付", "paid", "💰 已付款")]:
+            if body.startswith(kw):
+                kw2 = body[len(kw):].strip()
+                r = db.execute("SELECT * FROM visa_records WHERE project_id=? AND title LIKE ? ORDER BY id DESC LIMIT 1",
+                               (pid, f"%{kw2}%")).fetchone()
+                if not r:
+                    return f"⚠️ 没找到包含「{kw2}」的签证记录——发「签证清单」查看"
+                db.execute("UPDATE visa_records SET status=? WHERE id=?", (status, r["id"]))
+                db.commit()
+                return mark + "：" + r["title"] + (f"（{r['amount']/10000:.1f}万）" if r["amount"] else "")
+        # 查询：签证清单/记录/台账/状态
+        if any(k in msg for k in ["清单", "记录", "台账", "状态", "都有哪些", "哪些签证"]):
+            rows = db.execute("SELECT * FROM visa_records WHERE project_id=? ORDER BY id DESC LIMIT 20", (pid,)).fetchall()
+            if not rows:
+                return "📋 暂无签证记录——有变更时发「签证：XX内容（金额）」登记"
+            pending = [r for r in rows if r["status"] == "pending"]
+            lines = [f"📋 签证台账（{len(rows)} 条）："]
+            for r in rows:
+                mark = "🔴未签" if r["status"] == "pending" else ("🟢已签" if r["status"] == "signed" else "💰已付")
+                lines.append(f"- {mark} [{r['created_at'][:10]}] {r['title'][:40]}" + (f"（{r['amount']/10000:.1f}万）" if r["amount"] else ""))
+            if pending:
+                lines.append(f"\n🔴 未签 {len(pending)} 条——口头变更未签证是结算扯皮头号风险，建议尽快补签（发「签证：已签 XX」更新）")
+            return "\n".join(lines)
+        # 登记：签证：XX内容（金额）
+        if len(body) < 3:
+            return "📋 签证登记格式：「签证：塔吊租赁费变更（3万）」，查询「签证清单」，更新「签证：已签 XX」"
+        amount = extract_amount(body)
+        title = re.sub(r'[（(]\s*[\d.]+万?元?\s*[)）]', '', body).strip() or body
+        db.execute("INSERT INTO visa_records (project_id,title,amount,status,note) VALUES (?,?,?,?,?)",
+                   (pid, title, amount or 0, "pending", body[:80]))
+        db.execute("INSERT INTO events (project_id,event_type,who,subject,amount,source) VALUES (?,?,?,?,?,?)",
+                   (pid, "change", "老板", title, amount or 0, body[:120]))
+        db.commit()
+        tip = f"（金额 {amount/10000:.1f} 万）" if amount else "（未提到金额——补金额便于计价）"
+        return (f"📋 签证已登记：{title}{tip}\n"
+                "⚠️ 签证必须让**甲方签字确认**才有效——口头不算数。发「签证：已签 XX」更新状态。")
+    except Exception as e:
+        return f"⚠️ 签证处理异常：{e}"
+
+
+# ---------- ③ 材料台账（material_ledger） ----------
+def material_cmd(db, msg, pid):
+    """材料台账：登记 / 到货 / 清单"""
+    try:
+        if not pid:
+            return "⚠️ 还没有项目——先「新建项目：XXX，合同XX万，工期X个月」"
+        body = msg.split("：", 1)[-1].split(":", 1)[-1].strip() if ("：" in msg or ":" in msg) else msg
+        # 到货更新：材料到货：XX / 材料进场：XX
+        if "到货" in msg or "进场" in msg:
+            kw = body.replace("到货", "").replace("进场", "").strip()
+            r = db.execute("SELECT * FROM material_ledger WHERE project_id=? AND name LIKE ? ORDER BY id DESC LIMIT 1",
+                           (pid, f"%{kw}%")).fetchone()
+            if not r:
+                return f"⚠️ 没找到材料「{kw}」——先发「材料：{kw} 100个 1750元」登记"
+            db.execute("UPDATE material_ledger SET arrived=1 WHERE id=?", (r["id"],))
+            db.commit()
+            return f"📦 已到货：{r['name']}" + (f"（{r['qty']:g}{r['unit']}）" if r["qty"] else "")
+        # 查询：材料清单/台账
+        if any(k in msg for k in ["清单", "台账", "记录", "明细", "材料有哪些"]):
+            rows = db.execute("SELECT * FROM material_ledger WHERE project_id=? ORDER BY id DESC LIMIT 20", (pid,)).fetchall()
+            if not rows:
+                return "📦 暂无材料记录——发「材料：海尔冰箱 100台 1750元」登记"
+            lines = [f"📦 材料台账（{len(rows)} 条）："]
+            for r in rows:
+                mark = "✅" if r["arrived"] else "⏳"
+                line = f"- {mark} {r['name']}"
+                if r["brand"]:
+                    line += f"（{r['brand']}）"
+                if r["spec"]:
+                    line += f" {r['spec']}"
+                if r["qty"]:
+                    line += f" {r['qty']:g}{r['unit'] or ''}"
+                if r["price"]:
+                    line += f" ×{r['price']:g}元"
+                lines.append(line)
+            not_arrived = [r for r in rows if not r["arrived"]]
+            if not_arrived:
+                lines.append(f"\n⏳ 未到 {len(not_arrived)} 条——到货发「材料到货：XX」更新")
+            return "\n".join(lines)
+        # 登记：材料：海尔冰箱 100台 1750元
+        if len(body) < 2:
+            return "📦 材料登记格式：「材料：海尔冰箱 100台 1750元」，查询「材料清单」，到货「材料到货：海尔冰箱」"
+        price = None
+        m = re.search(r'([\d.]+)\s*(元|块)', body)
+        if m:
+            price = float(m.group(1))
+        qty, unit = None, ""
+        m2 = re.search(r'([\d.]+)\s*(台|个|套|件|米|方|吨|公斤|kg|箱|批|张|根|卷|桶)', body)
+        if m2:
+            qty = float(m2.group(1))
+            unit = m2.group(2)
+        name = body
+        if m2:  # 删数量段（如 "100台"/"100 台"）
+            name = name.replace(m2.group(0), "")
+        if m:   # 删单价段（如 "1750元"/"1750 元"）
+            name = name.replace(m.group(0), "")
+        name = re.sub(r'[\d.]+', '', name).replace("元", "").replace("块", "").replace("×", "").replace("x", "").strip()
+        name = re.sub(r'\s+', '', name)
+        if not name:
+            return "⚠️ 材料名没识别出来——格式：「材料：海尔冰箱 100台 1750元」"
+        db.execute("INSERT INTO material_ledger (project_id,name,spec,qty,unit,price,arrived) VALUES (?,?,?,?,?,?,?)",
+                   (pid, name, "", qty or 0, unit, price or 0, 0))
+        db.execute("INSERT INTO events (project_id,event_type,who,subject,source) VALUES (?,?,?,?,?)",
+                   (pid, "material", "老板", f"{name}" + (f" {qty:g}{unit}" if qty else "") + (f" {price:g}元" if price else ""), body[:120]))
+        db.commit()
+        return (f"📦 材料已登记：{name}" + (f"（{qty:g}{unit}）" if qty else "") + (f"，单价 {price:g} 元" if price else "")
+                + "\n发「材料清单」查看，到货发「材料到货：XX」")
+    except Exception as e:
+        return f"⚠️ 材料处理异常：{e}"
+
+
 # ---------- ⑦ 资源方管理 ----------
 def resource_cmd(db, msg, pid):
     """材料商/施工队/分包商：登记 / 到货 / 缺货 / 查询"""
@@ -889,18 +1232,114 @@ def llm_report(pid):
     resp = advisor_llm.generate_report(proj, events)
     return resp if resp else "⚠️ 周报生成失败（大模型无响应）"
 
-def generate_milestones(db, pid, months, start_date=None):
-    """按工期生成默认节点计划（阶段比例 + 交付物描述）"""
+def build_payment_schedule(db, pid, msg):
+    """解析付款条款（预付30%/进度款按月/质保金5%）→ 生成回款计划表"""
+    import re
+    contract = db.execute("SELECT contract FROM projects WHERE id=?", (pid,)).fetchone()
+    total = (contract["contract"] or 0) if contract else 0
+    rows = []
+    # 预付款：预付X%或首付X%
+    m = re.search(r'(?:预付|首付|预付款)[^\d]*?(\d+(?:\.\d+)?)\s*%', msg)
+    if m:
+        ratio = float(m.group(1)) / 100
+        rows.append(("预付款", ratio, total * ratio, "项目启动", "pending"))
+    # 质保金
+    m = re.search(r'质保[^\d]*?(\d+(?:\.\d+)?)\s*%', msg)
+    if m:
+        ratio = float(m.group(1)) / 100
+        rows.append(("质保金", ratio, total * ratio, "验收后1年", "pending"))
+    # 进度款：按月/按节点——剩余部分
+    used = sum(r[1] for r in rows)
+    remain = 1.0 - used
+    if "按月" in msg or "月结" in msg or "进度款" in msg:
+        # 按月进度款：剩余均分到工期月份（简单按 3 期）
+        n = 3
+        part = remain / n
+        for i in range(n):
+            rows.append((f"进度款{i+1}", part, total * part, f"施工期第{i+1}期", "pending"))
+    elif remain > 0:
+        rows.append(("结算款", remain, total * remain, "竣工验收", "pending"))
+    # 入库
+    db.execute("DELETE FROM payment_schedule WHERE project_id=?", (pid,))
+    for stage, ratio, amount, due, status in rows:
+        db.execute("INSERT INTO payment_schedule (project_id,stage,ratio,amount,due_date,status) VALUES (?,?,?,?,?,?)",
+                   (pid, stage, ratio, amount, due, status))
+    lines = [f"💰 回款计划已生成（合同 {total/10000:.1f} 万）："]
+    for r in rows:
+        lines.append(f"· {r[0]}：{r[2]/10000:.1f} 万（{r[1]*100:.0f}%）{r[3]}")
+    return "\n".join(lines)
+
+# ---------- ④ 节点按工程类型 ----------
+PROJECT_STAGE_TEMPLATES = {
+    "弱电": [  # 弱电/智能化：深化→采购→敷线→安装→调试→验收
+        ("深化设计", 0.15, "点位复核、图纸深化、设备清单确认"),
+        ("设备采购", 0.20, "主设备下单、到货验收、样品确认"),
+        ("管线敷设", 0.20, "桥架/管路敷设、线缆穿放、隐蔽验收"),
+        ("设备安装", 0.25, "前端设备安装、机房设备就位、接线"),
+        ("调试联调", 0.12, "单点调试、系统联调、试运行"),
+        ("验收交付", 0.08, "竣工验收、培训移交、资料归档"),
+    ],
+    "装修": [  # 装修/装饰：设计→拆除→水电→泥木→油漆→收尾
+        ("设计深化", 0.15, "效果图深化、材料选型、预算确认"),
+        ("拆除放线", 0.10, "拆改、放线、砌筑、防水基层"),
+        ("水电改造", 0.20, "水电管线敷设、隐蔽验收、防水"),
+        ("泥瓦木作", 0.25, "贴砖、吊顶、木作、墙面基层"),
+        ("油漆安装", 0.20, "油漆涂饰、主材安装、洁具灯具"),
+        ("验收交付", 0.10, "竣工验收、保洁、移交钥匙"),
+    ],
+    "安装": [  # 安装/机电：会审→采购→基础→安装→调试→验收
+        ("图纸会审", 0.10, "图纸会审、技术交底、施工方案"),
+        ("设备采购", 0.20, "设备/材料下单、到货验收"),
+        ("基础支架", 0.10, "基础浇筑、支架制作、预埋"),
+        ("设备安装", 0.35, "设备吊装就位、管道连接、接线"),
+        ("调试运行", 0.15, "单机调试、系统试运行、整改"),
+        ("验收交付", 0.10, "竣工验收、移交资料、培训"),
+    ],
+    "土建": [  # 土建/市政：基础→主体→安装→装饰→竣工
+        ("基础工程", 0.25, "土方、垫层、基础浇筑、验收"),
+        ("主体工程", 0.40, "主体结构施工、砌体、验收"),
+        ("安装工程", 0.20, "机电安装、管线预埋、安装验收"),
+        ("装饰装修", 0.10, "室内外装修、场地恢复"),
+        ("竣工交付", 0.05, "竣工验收、资料归档、移交"),
+    ],
+}
+# 默认（通用）：设计→采购→施工→验收→售后
+DEFAULT_STAGES = [
+    ("设计/预算确认", 0.15, "施工图/方案确认、预算清单、开工报审"),
+    ("材料采购", 0.20, "主材下单、进场验收、样品确认"),
+    ("施工实施", 0.55, "分项施工、隐蔽验收、过程检查"),
+    ("验收交付", 0.08, "竣工验收、整改销项、移交资料"),
+    ("售后/结算", 0.02, "结算对账、质保期服务、尾款回收"),
+]
+
+def infer_ptype(name):
+    """从项目名推断工程类型（弱电/装修/安装/土建/None通用）——关键词优先级：弱电>安装>装修>土建"""
+    if not name:
+        return None
+    weak = ["弱电", "智能", "监控", "安防", "网络", "布线", "机房", "门禁", "音视频", "会议", "信息化", "道闸", "一卡通"]
+    install = ["安装", "机电", "暖通", "空调", "电梯", "消防", "给排水", "管道", "风机", "设备安装", "冷库"]
+    decorate = ["装修", "装饰", "精装", "翻新", "家装", "工装", "软装", "整装"]
+    civil = ["土建", "市政", "道路", "管网", "桥梁", "绿化", "景观", "基础", "结构", "混凝土", "园林"]
+    for kw in weak:
+        if kw in name:
+            return "弱电"
+    for kw in install:
+        if kw in name:
+            return "安装"
+    for kw in decorate:
+        if kw in name:
+            return "装修"
+    for kw in civil:
+        if kw in name:
+            return "土建"
+    return None
+
+def generate_milestones(db, pid, months, start_date=None, ptype=None):
+    """按工期生成节点计划（按工程类型选模板——弱电/装修/安装/土建各有施工流程）"""
     from datetime import datetime as dt, timedelta as td
     start = dt.strptime(start_date, "%Y-%m-%d") if start_date else dt.now()
     total_days = int(months * 30)
-    stages = [
-        ("设计/预算确认", 0.15, "施工图/方案确认、预算清单、开工报审"),
-        ("材料采购", 0.35, "主材下单、进场验收、样品确认"),
-        ("施工实施", 0.90, "分项施工、隐蔽验收、过程检查"),
-        ("验收交付", 0.98, "竣工验收、整改销项、移交资料"),
-        ("售后/结算", 1.00, "结算对账、质保期服务、尾款回收"),
-    ]
+    stages = PROJECT_STAGE_TEMPLATES.get(ptype, DEFAULT_STAGES) if ptype else DEFAULT_STAGES
     rows = []
     offset = 0
     for name, ratio, note in stages:
@@ -908,6 +1347,8 @@ def generate_milestones(db, pid, months, start_date=None):
         plan = (start + td(days=int(total_days * offset))).strftime("%Y-%m-%d")
         db.execute("INSERT INTO project_milestones (project_id, stage, plan_date, note) VALUES (?,?,?,?)", (pid, name, plan, note))
         rows.append((name, plan))
+    if ptype:
+        db.execute("UPDATE projects SET ptype=? WHERE id=?", (ptype, pid))
     return rows
 
 def milestones_status(db, pid):
@@ -920,7 +1361,9 @@ def milestones_status(db, pid):
     today = datetime.now().strftime("%Y-%m-%d")
     done = sum(1 for r in rows if r["status"] == "done")
     pct = int(done / len(rows) * 100)
-    lines = [f"📅 项目节点计划（进度 {pct}%）："]
+    proj = db.execute("SELECT ptype FROM projects WHERE id=?", (pid,)).fetchone()
+    ptype = proj["ptype"] if proj and proj["ptype"] else None
+    lines = [f"📅 项目节点计划" + (f"（{ptype}工程）" if ptype else "") + f"（进度 {pct}%）："]
     lines.append(f"`{'█' * (pct // 10)}{'░' * (10 - pct // 10)}` {done}/{len(rows)}")
     for r in rows:
         if r["status"] == "done":
@@ -943,11 +1386,13 @@ def add_milestones(db, msg, pid):
     if not m:
         return "⚠️ 请提供工期：如「工期3个月」"
     db.execute("DELETE FROM project_milestones WHERE project_id=?", (pid,))
-    rows = generate_milestones(db, pid, float(m.group(1)))
+    proj = db.execute("SELECT name,ptype FROM projects WHERE id=?", (pid,)).fetchone()
+    ptype = infer_ptype(proj["name"] if proj else "") or (proj["ptype"] if proj and proj["ptype"] else None)
+    rows = generate_milestones(db, pid, float(m.group(1)), ptype=ptype)
     db.execute("UPDATE project_docs SET status='provided', provided_at=datetime('now','localtime') WHERE project_id=? AND doc_name LIKE '%工期%'", (pid,))
     db.execute("UPDATE project_docs SET guide_done=1 WHERE project_id=? AND guide_order=3", (pid,))
     db.commit()
-    return "📅 节点计划已生成（按工期 %s 个月）：\n" % m.group(1) + "\n".join(f"· {s}：{d}" for s, d in rows)
+    return "📅 节点计划已生成（按工期 %s 个月" % m.group(1) + ("，**%s工程**流程" % ptype if ptype else "") + "）：\n" + "\n".join(f"· {s}：{d}" for s, d in rows)
 
 def milestone_done(db, msg, pid):
     """标记节点完成：节点：完成 施工实施"""
