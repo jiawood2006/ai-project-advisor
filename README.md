@@ -21,9 +21,18 @@ python3 advisor_llm.py      # LLM enhancement test (diagnosis/report)
 
 ### New in latest version
 
-- **Guided Onboarding (引导性建档)**: AI walks the client through 6-step base-doc setup one step at a time — answer one, next step appears
-- **Milestone Plan (节点计划)**: give a duration (工期3个月) and AI auto-generates a 5-stage milestone schedule, tracks overdue, one-command status updates
-- **Doc Requirements (顾问要求资料)**: advisor actively asks for required docs (contract/drawings/payment terms), tracks provided/missing status
+- **WeCom Smart Bot (企微智能机器人 API 模式)**: FREE channel — receive files/text/images from users, encrypted callback reply (msgtype=stream), file decryption (AESKey)
+- **File Auto-Project (文件智能建项目)**: Upload .xlsx / .xls / Word(.docx) / text — AI extracts project name, contract amount (auto from 合计 row), duration → auto-create project + milestone plan
+- **Contract Risk Assessment (合同风险评估)**: contract text stored on upload → risk advisor analyzes contract clauses / client / project in 3 dimensions with P0/P1 action plan
+- **Photo-to-Ledger (拍照即记账)**: receipts / visa / acceptance photos OCR → auto-record business facts
+- **Speech-to-Data (说话录入)**: "收到进度款20万" → auto-update received amount; changes / promises / issues / progress all auto-recorded
+- **8 Advisor Modules (八大顾问)**: Progress (critical path + catch-up) / Payment (aging + collection) / Change (visa completeness) / Docs / Risk (contract-aware) / Inspection / Review / Training — each with professional framework
+- **Resource Management (资源方管理)**: supplier/team profile, arrival/shortage tracking, efficiency & load alerts
+- **Memory Recall (记忆图谱)**: "回忆一下XX说过什么" — query by person/topic from archived originals
+- **Business Decisions (经营决策)**: profit forecast / cashflow gap / receivable aging / bid evaluation
+- **Proactive Morning Brief (主动预警)**: daily 7:30 cron — milestone due / overdue payment / open risks
+- **Guided Onboarding (引导性建档)**: AI walks the client through 6-step base-doc setup one step at a time
+- **Milestone Plan (节点计划)**: 5-stage schedule with deliverables + progress bar + overdue tracking
 
 ### Architecture
 

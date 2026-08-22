@@ -15,6 +15,11 @@ except ImportError:
 
 DB_PATH = os.path.expanduser("~/wiki/ai-project-advisor/advisor.db")
 
+def set_db_path(path):
+    """多租户：切换当前数据库文件（每客户一个独立库）"""
+    global DB_PATH
+    DB_PATH = os.path.expanduser(path)
+
 # 免费版群数上限（收费版可调大——配置项）
 MAX_GROUPS = 3
 
@@ -75,6 +80,21 @@ CREATE TABLE IF NOT EXISTS project_milestones (
   plan_date TEXT,                 -- 计划日期
   status TEXT DEFAULT 'pending',  -- pending/done/overdue
   note TEXT,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE TABLE IF NOT EXISTS resources (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,             -- 材料商/施工队/分包商名
+  rtype TEXT,                     -- supplier/team/subcontractor
+  contact TEXT, price TEXT, terms TEXT,
+  rating INTEGER DEFAULT 3,       -- 信誉 1-5
+  note TEXT,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE TABLE IF NOT EXISTS resource_events (
+  id INTEGER PRIMARY KEY,
+  resource_id INTEGER, event_type TEXT,  -- order/arrive/shortage/issue
+  project_id INTEGER, content TEXT,
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 """
@@ -310,11 +330,19 @@ def _handle(db, msg, who, project_id, group_id):
     if "新建项目" in msg:
         return create_project(db, msg, group_id)
 
-    # ---- 未绑定群引导 ----
+    # ---- 未绑定群：自由问答（不拦截）----
     if group_id and project_id is None:
-        return ("📌 这是新项目群——先绑定项目才能记录：\n"
-                "· 绑定现有项目：「绑定项目：项目名」\n"
-                "· 创建新项目：「新建项目：XXX，合同80万，工期3个月，负责人王经理」")
+        hint = "\n\n💡 发「新建项目：XXX，合同XX万，工期X个月，负责人XX」或「绑定项目：XXX」，即可开始项目记录"
+        if LLM_AVAILABLE:
+            try:
+                resp = advisor_llm.chat([{"role": "system", "content": "你是工程顾问 AI 助手。客户还未绑定项目。请直接回答客户的问题（工程/施工/管理类均可），回答简洁专业。若客户想记录项目内容，提示先发「新建项目：项目名，合同金额，工期，负责人」。"}, {"role": "user", "content": msg}])
+                if resp and not resp.startswith("__LLM_ERROR__"):
+                    return resp  # 纯 LLM 回答（不再附加绑定提示）
+            except Exception:
+                pass
+        return ("我是工程顾问 AI——目前还未绑定项目。\n"
+                "· 新建项目：「新建项目：XXX，合同80万，工期3个月，负责人王经理」\n"
+                "· 绑定项目：「绑定项目：项目名」")
 
     # ---- 资料清单命令 ----
     if ("资料" in msg) and ("提供资料" in msg):
@@ -333,8 +361,29 @@ def _handle(db, msg, who, project_id, group_id):
     # ---- 建档命令 ----
     if "建档" in msg:
         return onboarding_status(db, project_id)
-    # ---- 引导模式（建档未完成——把回复匹配到步骤）----
-    if project_id:
+    # ---- ⑧ 记忆图谱：回忆/查证（提前于建档拦截——避免"回忆合同"被误判为提供合同）----
+    if any(k in msg for k in ["回忆", "查一下当时", "之前说过", "谁说的", "原话"]):
+        return memory_recall(db, project_id, msg)
+
+    # ---- ⑦ 资源方管理：登记/到货/缺货/查询（提前于建档拦截）----
+    if msg.startswith("材料商") or msg.startswith("施工队") or msg.startswith("分包商"):
+        return resource_cmd(db, msg, project_id)
+
+    # ---- 顾问命令（风险/进度/回款/经营等）提前于建档拦截——建档中也要专业分析 ----
+    if any(k in msg for k in ["风险分析", "有什么风险", "风险顾问", "会不会有风险", "哪里危险"]):
+        return llm_advisor(project_id, "风险", msg)
+    if any(k in msg for k in ["进度分析", "进度怎么样", "进度如何", "会不会延期", "进度顾问"]):
+        return llm_advisor(project_id, "进度", msg)
+    if any(k in msg for k in ["回款分析", "回款情况", "回款顾问", "催款", "应收", "收了多少"]):
+        return llm_advisor(project_id, "回款", msg)
+    if any(k in msg for k in ["盈利预测", "能赚多少", "利润", "现金流", "资金缺口", "接单评估", "这个单能接吗"]):
+        return llm_biz(project_id, msg)
+
+    # ---- 业务消息优先：建档引导不拦截收款/承诺/变更/问题/进度等 ----
+    _biz_intent = classify_intent(msg)
+    _is_biz = _biz_intent not in ("record",)
+    # ---- 引导模式（建档未完成——只拦非业务消息）----
+    if project_id and not _is_biz:
         pending = db.execute("SELECT * FROM project_docs WHERE project_id=? AND doc_type='base' AND guide_done=0 ORDER BY guide_order LIMIT 1", (project_id,)).fetchone()
         if pending:
             step_no = match_onboarding(msg)
@@ -342,7 +391,18 @@ def _handle(db, msg, who, project_id, group_id):
                 return onboarding_complete_step(db, msg, project_id, step_no)
             if ("提供资料" in msg) or ("已提供" in msg):
                 return provide_doc(db, msg, project_id)
-            return (f"📋 建档进行中——当前：**第 {pending['guide_order']} 步**【{pending['doc_name']}】\n"
+            # 建档进行中：先认真回答用户问题（顾问式），建档提示只放最后一行——不喧宾夺主
+            try:
+                import advisor_llm
+                pname = db.execute("SELECT name FROM projects WHERE id=?", (project_id,)).fetchone()
+                pname = pname["name"] if pname else "本项目"
+                sys_p = f"你是资深工程项目顾问，服务客户「{pname}」。客户正在建档但随时会问问题。请：1) 优先认真回答客户的问题（风险/进度/施工/管理均可），像真顾问一样给出专业分析和建议；2) 不要反复强调建档流程；3) 回答简洁专业。只需输出回答正文。"
+                resp = advisor_llm.chat([{"role": "system", "content": sys_p}, {"role": "user", "content": msg}], temperature=0.3, max_tokens=400)
+                if resp and not resp.startswith("__LLM_ERROR__"):
+                    return f"💬 {resp}\n\n_（建档进行中：第 {pending['guide_order']} 步——发「建档」可查看进度）_"
+            except Exception:
+                pass
+            return (f"建档进行中——当前：**第 {pending['guide_order']} 步**【{pending['doc_name']}】\n"
                     f"{ONBOARDING_HINTS.get(pending['guide_order'], '')}\n"
                     f"（发「建档」查看进度）")
 
@@ -356,6 +416,47 @@ def _handle(db, msg, who, project_id, group_id):
         return llm_diagnose(pid)
     if any(k in msg for k in ["生成周报", "周报", "写周报", "出一份周报"]):
         return llm_report(pid)
+    # ⑤ 八大顾问模块：进度/回款/变更/资料/风险/巡检/新人
+    if any(k in msg for k in ["进度分析", "进度怎么样", "进度如何", "会不会延期", "进度顾问"]):
+        return llm_advisor(pid, "进度", msg)
+    if any(k in msg for k in ["回款分析", "回款情况", "回款顾问", "催款", "应收", "收了多少"]):
+        return llm_advisor(pid, "回款", msg)
+    if any(k in msg for k in ["变更分析", "变更顾问", "签证"]):
+        return llm_advisor(pid, "变更", msg)
+    if any(k in msg for k in ["资料分析", "资料顾问", "资料全吗", "资料齐"]):
+        return docs_status(db, project_id)
+    if any(k in msg for k in ["风险分析", "有什么风险", "风险顾问", "会不会有风险", "哪里危险"]):
+        return llm_advisor(pid, "风险", msg)
+    if any(k in msg for k in ["巡检", "检查清单", "验收清单"]):
+        return llm_advisor(pid, "巡检", msg)
+    if any(k in msg for k in ["新人", "怎么干", "流程规范", "新手", "培训"]):
+        return llm_advisor(pid, "新人", msg)
+    # ⑥ 风险登记（人工上报：风险：甲方被执行/供应商失信）
+    if msg.startswith("风险：") or msg.startswith("风险:"):
+        db.execute("INSERT INTO alerts (project_id,type,severity,content) VALUES (?,?,?,?)",
+                   (pid, "manual", "warning", msg[3:].strip()))
+        db.commit()
+        return f"⚠️ 风险已登记并预警：「{msg[3:].strip()}」——已加入监控，后续可发「风险分析」查看处理建议。"
+    # 风险清单/复查
+    if "风险清单" in msg or "风险列表" in msg or "风险复查" in msg or "风险记录" in msg:
+        rows = db.execute("SELECT content,severity,status,created_at FROM alerts WHERE project_id=? ORDER BY id DESC LIMIT 10", (pid,)).fetchall()
+        if not rows:
+            return "✅ 当前无风险记录。"
+        lines = [f"🚨 风险清单（{len(rows)} 条）："]
+        for r in rows:
+            mark = "🟢已处理" if r["status"] == "done" else ("🔴" if r["severity"] == "critical" else "🟠")
+            lines.append(f"- {mark} [{r['created_at'][:10]}] {r['content'][:60]}")
+        lines.append("\n（发「风险：XX」登记新风险；「风险分析」看处理建议）")
+        return "\n".join(lines)
+    # ⑦ 资源方管理：登记/到货/缺货/查询
+    if msg.startswith("材料商") or msg.startswith("施工队") or msg.startswith("分包商"):
+        return resource_cmd(db, msg, pid)
+    # ⑧ 记忆图谱：回忆/查证（对话即档案）
+    if any(k in msg for k in ["回忆", "查一下当时", "之前说过", "谁说的", "原话"]):
+        return memory_recall(db, pid, msg)
+    # ⑨ 经营决策：盈利/现金流/接单
+    if any(k in msg for k in ["盈利预测", "能赚多少", "利润", "现金流", "资金缺口", "接单评估", "这个单能接吗"]):
+        return llm_biz(pid, msg)
     # 全局查询（跨项目比较）
     if any(k in msg for k in ["哪个项目", "所有项目", "全部项目", "最慢", "最快", "最危险", "对比"]):
         return global_query(db, msg)
@@ -458,11 +559,245 @@ def _handle(db, msg, who, project_id, group_id):
         db.commit()
         return f"✅ 进度已记录：「{msg[:50]}」——已存入 {proj['name'] if proj else ''} 项目档案。"
 
-    # 其他 → 记录
+    # 其他/未识别 → LLM 顾问核心：自然回答 + 说话录入（自动识别业务信息并记录）
+    if LLM_AVAILABLE:
+        try:
+            pname = proj["name"] if proj else (db.execute("SELECT name FROM projects WHERE id=?", (pid,)).fetchone() or {}).get("name") if pid else None
+            recent = db.execute("SELECT subject, source FROM events WHERE project_id=? ORDER BY id DESC LIMIT 5", (pid,)).fetchall() if pid else []
+            recent_txt = "\n".join(f"- {r['subject']}" for r in recent) if recent else "（暂无记录）"
+            sys_p = (
+                "你是资深工程项目顾问，服务中小施工/装修公司。客户发来消息，请：\n"
+                "1) 自然回答客户（风险/进度/施工/管理/回款均可），像真顾问一样专业、简洁、给方法\n"
+                "2) 如果消息是业务事实（收款/付款/变更/承诺/问题/进度/人员变动），先在心里记住，回答末尾附一行：📌 已记录：<一句话概括>\n"
+                "3) 不要机械，不要反复引导建档。"
+            )
+            user_p = f"客户：{who}\n项目：{pname or '未指定'}\n最近记录：\n{recent_txt}\n\n客户说：{msg}"
+            resp = advisor_llm.chat([{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}], temperature=0.3, max_tokens=500)
+            if resp and not resp.startswith("__LLM_ERROR__"):
+                # 尽量把业务事实落库（events）
+                if pid:
+                    try:
+                        db.execute("INSERT INTO events (project_id,event_type,who,subject,source) VALUES (?,?,?,?,?)",
+                                   (pid, "record", who, msg[:60], msg))
+                        db.commit()
+                    except Exception:
+                        pass
+                return resp
+        except Exception:
+            pass
     db.execute("INSERT INTO events (project_id,event_type,who,subject,source) VALUES (?,?,?,?,?)",
                (pid, "record", who, msg[:60], msg))
     db.commit()
     return f"📋 已记录：「{msg[:50]}」"
+
+# ---------- ⑤ 八大顾问模块 ----------
+def llm_advisor(pid, module, msg):
+    """顾问模块：进度/回款/变更/风险/巡检/新人——LLM 带项目上下文分析"""
+    db = get_db()
+    try:
+        proj = db.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+        if not proj:
+            return "⚠️ 还没有项目——先「新建项目：XXX，合同XX万，工期X个月」"
+        p = dict(proj)
+        events = db.execute("SELECT event_type,who,subject,amount,due_date,created_at FROM events WHERE project_id=? ORDER BY id DESC LIMIT 12", (pid,)).fetchall()
+        ev_txt = "\n".join(f"- [{e['created_at'][:10]}][{e['event_type']}]{e['who']}：{e['subject']}" for e in events) or "（暂无记录）"
+        ms = db.execute("SELECT stage, plan_date, status FROM project_milestones WHERE project_id=? ORDER BY plan_date", (pid,)).fetchall()
+        ms_txt = "\n".join(f"- {m['stage']}：{m['plan_date']}（{m['status']}）" for m in ms) or "（暂无节点）"
+        import advisor_llm
+        # 风险评估：专业框架（合同/甲方/项目三维度）
+        if module == "风险":
+            # 读合同全文（文件建项目时存的）
+            contract = db.execute("""SELECT source FROM events WHERE project_id=? AND event_type='contract'
+                ORDER BY id DESC LIMIT 1""", (pid,)).fetchone()
+            contract_txt = (contract["source"][:1500] if contract and contract["source"] else "（未提供合同文本——可发合同文件让我分析条款）")
+            prompt = f"""你是资深工程项目风险顾问（有 20 年工程纠纷处理经验）。项目「{p['name']}」：
+合同金额 {p['contract']/10000:.1f} 万，已收 {p['received']/10000:.1f} 万，阶段 {p['stage']}。
+合同文本：
+{contract_txt}
+项目记录：
+{ev_txt}
+节点计划：
+{ms_txt}
+请做【专业风险评估】，按以下框架输出：
+一、合同风险：结合合同文本分析——付款条款是否有利、变更/签证条款、违约金/质保金比例、工期违约风险
+二、甲方风险：结合合同中的甲方信息（名称/法人/主体）分析——付款能力、是否有拖延迹象、人员变动、被诉/被执行风险
+三、项目风险：进度风险（节点是否按期）、成本风险（预算/超支）、质量风险（验收）、资料风险（签证/验收单缺失）
+四、总体评级：高风险/中风险/低风险 + 一句话结论
+五、应对建议：3-5 条可执行措施（分 P0/P1 优先级）
+要求：结合合同具体条款和记录事实，不要空话，600字内。"""
+        else:
+            # 各顾问模块专业框架
+            frameworks = {
+                "进度": """你是资深进度顾问。请做进度分析：
+一、当前进度判断：各节点状态（按期/临近/逾期）、整体进度偏差
+二、关键路径：当前卡点在哪（设计/采购/施工/验收）
+三、延期风险：逾期节点的影响、连锁风险
+四、赶工建议：可执行措施（增派人员/平行作业/优化工序）分优先级""",
+                "回款": """你是资深回款顾问。请做回款分析：
+一、回款现状：合同额/已收/应收/逾期应收
+二、应收账龄：每笔应收的账龄、逾期原因
+三、催收策略：按优先级给催收话术和动作（发函/约谈/暂停施工/法律）
+四、现金流影响：资金缺口、垫资压力""",
+                "变更": """你是资深变更顾问。请做变更分析：
+一、变更台账：已记录变更、金额、签证状态
+二、签证完整性：口头变更未签证的风险点
+三、计价风险：变更无价的隐患
+四、补签建议：按优先级列出需要立即补签证的项""",
+                "巡检": """你是资深巡检顾问。请按工程巡检清单分析：
+一、质量巡检：关键工序（防水/电气/结构）检查要点
+二、安全巡检：临电/防护/机械/消防
+三、资料巡检：验收单/签证/隐蔽资料齐全性
+四、巡检安排：本周应做的巡检项清单""",
+                "新人": """你是资深工程老师傅。新人问：{msg}
+请用大白话讲清楚：流程步骤、规范要点、常见坑、跟谁对接。分步说明，像师傅带徒弟。""",
+            }
+            fw = frameworks.get(module, "")
+            prompt = f"""你是资深工程项目顾问。客户项目「{p['name']}」（合同 {p['contract']/10000:.1f} 万，已收 {p['received']/10000:.1f} 万）。
+节点计划：
+{ms_txt}
+项目记录：
+{ev_txt}
+{fw}
+客户问（{module}顾问）：{msg}
+请按上述框架专业分析，结合记录事实，简洁专业，500字内。"""
+        resp = advisor_llm.chat([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=800)
+        if resp and not resp.startswith("__LLM_ERROR__"):
+            return f"🔍 【{module}顾问】\n{resp}"
+        return f"（顾问分析暂不可用——项目数据：{p['name']} 合同 {p['contract']/10000:.1f} 万，记录 {len(events)} 条）"
+    finally:
+        db.close()
+
+
+# ---------- ⑥ 风险登记已接入 ----------
+# ---------- ⑦ 资源方管理 ----------
+def resource_cmd(db, msg, pid):
+    """材料商/施工队/分包商：登记 / 到货 / 缺货 / 查询"""
+    try:
+        # 解析资源名（去掉前缀和后缀动词）
+        def _res_name():
+            n = msg.split("：")[0].split(":")[0].replace("材料商", "").replace("施工队", "").replace("分包商", "").strip()
+            for suf in ["到了", "到货", "缺货了", "缺货", "没到", "延迟", "干活", "负载", "工效", "忙不忙", "怎么样"]:
+                n = n.replace(suf, "")
+            return n.strip()
+        if "到货" in msg or "到了" in msg:
+            name = _res_name()
+            r = db.execute("SELECT * FROM resources WHERE name LIKE ?", (f"%{name}%",)).fetchone()
+            if not r:
+                db.execute("INSERT INTO resources (name,rtype,note) VALUES (?,?,?)", (name, "supplier", "自动登记"))
+                db.commit()
+                r = db.execute("SELECT * FROM resources WHERE name LIKE ?", (f"%{name}%",)).fetchone()
+            rid = r["id"] if isinstance(r, sqlite3.Row) else r
+            db.execute("INSERT INTO resource_events (resource_id,event_type,project_id,content) VALUES (?,?,?,?)", (rid, "arrive", pid, msg[:80]))
+            db.commit()
+            return f"✅ 已记录到货：{name}"
+        if "缺货" in msg or "没到" in msg or "延迟" in msg:
+            name = _res_name()
+            r = db.execute("SELECT * FROM resources WHERE name LIKE ?", (f"%{name}%",)).fetchone()
+            if not r:
+                db.execute("INSERT INTO resources (name,rtype,note) VALUES (?,?,?)", (name, "supplier", "自动登记"))
+                db.commit()
+                r = db.execute("SELECT * FROM resources WHERE name LIKE ?", (f"%{name}%",)).fetchone()
+            rid = r["id"] if isinstance(r, sqlite3.Row) else r
+            db.execute("INSERT INTO resource_events (resource_id,event_type,project_id,content) VALUES (?,?,?,?)", (rid, "shortage", pid, msg[:80]))
+            db.execute("INSERT INTO alerts (project_id,type,severity,content) VALUES (?,?,?,?)", (pid, "resource", "warning", f"{name}缺货/延迟：{msg[:50]}"))
+            db.commit()
+            return f"⚠️ 已记录缺货并预警：{name}——已加入节点影响分析。"
+        # 查询资源方
+        if "工效" in msg or "干活" in msg or "哪个队" in msg:
+            rows = db.execute("""SELECT r.name, r.rating,
+                (SELECT COUNT(*) FROM resource_events re WHERE re.resource_id=r.id) as cnt
+                FROM resources r ORDER BY r.rating DESC""").fetchall()
+            if not rows:
+                return "还没有施工队/材料商记录——发「施工队XX到了」登记"
+            lines = ["📊 工效/信誉分析："]
+            for r in rows:
+                lines.append(f"- {r['name']}：信誉{'⭐'*r['rating']}，记录 {r['cnt']} 条")
+            return "\n".join(lines)
+        # 负载预警：资源方同时挂多个项目
+        if "负载" in msg or "冲突" in msg or "忙" in msg:
+            rows = db.execute("""SELECT r.name, COUNT(DISTINCT re.project_id) as pc
+                FROM resources r JOIN resource_events re ON re.resource_id=r.id
+                GROUP BY r.id HAVING pc >= 2""").fetchall()
+            if rows:
+                return "🚨 资源负载预警：\n" + "\n".join(f"- {r['name']} 同时在 {r['pc']} 个项目" for r in rows)
+            return "✅ 当前无资源负载冲突。"
+        rows = db.execute("SELECT name,rtype,rating,note FROM resources ORDER BY id DESC LIMIT 10").fetchall()
+        if rows:
+            lines = ["📇 资源方档案："]
+            for r in rows:
+                lines.append(f"- {r['name']}（{r['rtype']}）信誉{'⭐'*r['rating']} {r['note'] or ''}")
+            return "\n".join(lines)
+        return "还没有资源方档案——发「材料商XX：价格/账期」登记"
+    except Exception as e:
+        return f"⚠️ 资源方处理异常：{e}"
+
+
+# ---------- ⑧ 记忆图谱（对话即档案，可调取） ----------
+def memory_recall(db, pid, msg):
+    """回忆/查证：从 events 调取历史原话（支持按人/按事/全部）"""
+    try:
+        # 按人查询：谁/老王/李经理
+        who = None
+        for w in ["老王", "李经理", "王经理", "张工", "李工", "王工", "老板", "甲方", "监理", "供应商", "施工队"]:
+            if w in msg:
+                who = w
+                break
+        kw = msg.replace("回忆", "").replace("查一下当时", "").replace("之前说过", "").replace("谁说的", "").replace("原话", "").replace("一下", "").replace(who or "", "").strip()
+        q = f"%{kw}%" if kw else "%"
+        if who:
+            rows = db.execute("""SELECT who,subject,source,created_at FROM events
+                WHERE project_id=? AND who LIKE ?
+                ORDER BY id DESC LIMIT 10""", (pid, f"%{who}%")).fetchall()
+            if not rows:
+                return f"没有找到 {who} 的相关记录"
+            lines = [f"🗂️ {who} 说过/做过（{len(rows)} 条）："]
+            for r in rows:
+                lines.append(f"- [{r['created_at'][:10]}] {r['source'] or r['subject']}")
+            return "\n".join(lines)
+        rows = db.execute("""SELECT who,subject,source,created_at FROM events
+            WHERE project_id=? AND (subject LIKE ? OR source LIKE ?)
+            ORDER BY id DESC LIMIT 8""", (pid, q, q)).fetchall()
+        if not rows:
+            return f"没有找到相关记录" + (f"（关键词：{kw}）" if kw else "")
+        lines = [f"🗂️ 项目记忆（{'全部' if not kw else '关键词：' + kw}）："]
+        for r in rows:
+            lines.append(f"- [{r['created_at'][:10]}] {r['who']}：{r['source'] or r['subject']}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"⚠️ 记忆查询异常：{e}"
+
+
+# ---------- ⑨ 经营决策 ----------
+def llm_biz(pid, msg):
+    """盈利预测/现金流/接单评估——LLM 分析"""
+    db = get_db()
+    try:
+        proj = db.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+        if not proj:
+            return "⚠️ 还没有项目数据——先建项目"
+        p = dict(proj)
+        events = db.execute("SELECT event_type,amount,subject,created_at FROM events WHERE project_id=? ORDER BY id DESC LIMIT 15", (pid,)).fetchall()
+        ev_txt = "\n".join(f"- [{e['created_at'][:10]}][{e['event_type']}]{e['subject']}" + (f"（{e['amount']/10000:.1f}万）" if e['amount'] else "") for e in events) or "（暂无）"
+        # 现金流预测表：应收（open 收款）+ 到期
+        recv = db.execute("""SELECT subject, amount, due_date FROM events
+            WHERE project_id=? AND event_type='payment' AND status='open' AND amount IS NOT NULL
+            ORDER BY due_date""", (pid,)).fetchall()
+        recv_txt = "\n".join(f"- {r['subject']} {r['amount']/10000:.1f} 万（应到 {r['due_date'] or '未定'}）" for r in recv) or "（无应收）"
+        import advisor_llm
+        prompt = f"""你是工程公司经营顾问。项目「{p['name']}」：合同 {p['contract']/10000:.1f} 万，已收 {p['received']/10000:.1f} 万，进度 {p['stage']}。
+收支记录：
+{ev_txt}
+应收款：
+{recv_txt}
+客户问：{msg}
+请做经营分析：当前盈利/现金流状况、应收风险、资金缺口预测、建议。简洁专业，400字内。"""
+        resp = advisor_llm.chat([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=600)
+        if resp and not resp.startswith("__LLM_ERROR__"):
+            return f"💼 经营顾问\n{resp}"
+        return f"（经营分析暂不可用——合同 {p['contract']/10000:.1f} 万，已收 {p['received']/10000:.1f} 万）"
+    finally:
+        db.close()
+
 
 def parse_due(msg):
     """解析承诺到期日（明天/下周/月底/几号）"""
@@ -555,35 +890,38 @@ def llm_report(pid):
     return resp if resp else "⚠️ 周报生成失败（大模型无响应）"
 
 def generate_milestones(db, pid, months, start_date=None):
-    """按工期生成默认节点计划（阶段比例）"""
+    """按工期生成默认节点计划（阶段比例 + 交付物描述）"""
     from datetime import datetime as dt, timedelta as td
     start = dt.strptime(start_date, "%Y-%m-%d") if start_date else dt.now()
     total_days = int(months * 30)
     stages = [
-        ("设计/预算确认", 0.15),
-        ("材料采购", 0.20),
-        ("施工实施", 0.55),
-        ("验收交付", 0.08),
-        ("售后/结算", 0.02),
+        ("设计/预算确认", 0.15, "施工图/方案确认、预算清单、开工报审"),
+        ("材料采购", 0.35, "主材下单、进场验收、样品确认"),
+        ("施工实施", 0.90, "分项施工、隐蔽验收、过程检查"),
+        ("验收交付", 0.98, "竣工验收、整改销项、移交资料"),
+        ("售后/结算", 1.00, "结算对账、质保期服务、尾款回收"),
     ]
     rows = []
     offset = 0
-    for name, ratio in stages:
+    for name, ratio, note in stages:
         offset += ratio
         plan = (start + td(days=int(total_days * offset))).strftime("%Y-%m-%d")
-        db.execute("INSERT INTO project_milestones (project_id, stage, plan_date) VALUES (?,?,?)", (pid, name, plan))
+        db.execute("INSERT INTO project_milestones (project_id, stage, plan_date, note) VALUES (?,?,?,?)", (pid, name, plan, note))
         rows.append((name, plan))
     return rows
 
 def milestones_status(db, pid):
-    """节点计划状态"""
+    """节点计划状态（专业展示）"""
     if not pid:
         return "⚠️ 请先在项目群里操作"
     rows = [dict(r) for r in db.execute("SELECT * FROM project_milestones WHERE project_id=? ORDER BY plan_date", (pid,))]
     if not rows:
         return "⚠️ 还没有节点计划——请提供工期（如「工期3个月」）——否则顾问无法按节点提醒"
     today = datetime.now().strftime("%Y-%m-%d")
-    lines = ["📅 项目节点计划："]
+    done = sum(1 for r in rows if r["status"] == "done")
+    pct = int(done / len(rows) * 100)
+    lines = [f"📅 项目节点计划（进度 {pct}%）："]
+    lines.append(f"`{'█' * (pct // 10)}{'░' * (10 - pct // 10)}` {done}/{len(rows)}")
     for r in rows:
         if r["status"] == "done":
             mark = "✅"
@@ -592,8 +930,9 @@ def milestones_status(db, pid):
         else:
             mark = "⏳"
         over = "（已逾期！）" if mark == "🚨" else ""
-        lines.append(f"  {mark} {r['stage']}：{r['plan_date']}{over}")
-    lines.append("（发「节点：完成 施工实施」更新）")
+        note = f" — {r['note']}" if r.get("note") else ""
+        lines.append(f"  {mark} **{r['stage']}** {r['plan_date']}{over}\n    {note}")
+    lines.append("（发「节点：完成 施工实施」更新；「节点状态」查看）")
     return "\n".join(lines)
 
 def add_milestones(db, msg, pid):

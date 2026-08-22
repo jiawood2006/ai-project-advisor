@@ -1,0 +1,14 @@
+# 凭证/密钥
+*.env
+.ops_tokens
+tenants.json
+data/*.db
+
+# 临时/日志
+/tmp/
+*.log
+__pycache__/
+*.pyc
+
+# 下载文件
+advisor_files/
