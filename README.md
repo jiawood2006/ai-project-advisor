@@ -32,6 +32,11 @@ python3 advisor_llm.py      # LLM enhancement test (diagnosis/report)
 - **Business Decisions (经营决策)**: profit forecast / cashflow gap / receivable aging / bid evaluation
 - **Proactive Morning Brief (主动预警)**: daily 7:30 cron — milestone due / overdue payment / open risks
 - **Guided Onboarding (引导性建档)**: AI walks the client through 6-step base-doc setup one step at a time
+- **Visa Ledger (签证台账, 2026-08-23)**: "签证：增项吊顶（2.5万）" register → "签证清单" query (pending/signed/paid) → "签证：已签 XX" update; change advisor reads the ledger
+- **Material Ledger (材料台账, 2026-08-23)**: "材料：海尔冰箱 100台 1750元" register (name/qty/price parse) → "材料清单" query → "材料到货：XX" arrival update
+- **Milestones by Project Type (节点按工程类型, 2026-08-23)**: auto-detect weak-current/decoration/installation/civil works from project name → 4 stage templates with real construction flows
+- **Industry Knowledge Base (行业知识库 L1, 2026-08-23)**: 8 categories × 12 entries with legal citations (民法典 807, 司法解释一, 建质〔2017〕138号...) — direct Q&A ("质保金一般留多少") or auto-injected into advisor analysis
+- **Fix: "付款节点" no longer misread as milestone query (付款节点误判修复, 2026-08-23)**
 - **Milestone Plan (节点计划)**: 5-stage schedule with deliverables + progress bar + overdue tracking
 
 ### Architecture
