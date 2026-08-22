@@ -102,7 +102,16 @@ class TenantBot:
         # 智能机器人回调是 JSON（msgtype/file/response_url）；自建应用是 XML
         if xml_body and xml_body.lstrip()[:1] == "{":
             try:
-                return self.handle_aibot(json.loads(xml_body), timestamp, nonce)
+                result = self.handle_aibot(json.loads(xml_body), timestamp, nonce)
+                try:
+                    _mid = (json.loads(xml_body).get("msgid") or "").strip()
+                    if _mid:
+                        if not hasattr(type(self), "_seen_msgs"):
+                            type(self)._seen_msgs = {}
+                        type(self)._seen_msgs[_mid] = (time.time(), result)
+                except Exception:
+                    pass
+                return result
             except Exception as e:
                 try:
                     with open("/tmp/wecom_bot_debug.log", "a") as f:
@@ -173,6 +182,18 @@ class TenantBot:
     # ---------- 智能机器人（API 模式 JSON 消息）处理 ----------
     def handle_aibot(self, data, timestamp=None, nonce=None):
         """智能机器人回调：{"msgtype":"file","file":{"url":...},"response_url":...,"from":{"userid":...}}"""
+        # 消息去重：企微会重试，同一 msgid 10 秒内直接返回上次响应
+        try:
+            _mid = (data.get("msgid") or "").strip()
+            if _mid:
+                import threading
+                if not hasattr(type(self), "_seen_msgs"):
+                    type(self)._seen_msgs = {}
+                now = time.time()
+                if _mid in type(self)._seen_msgs and now - type(self)._seen_msgs[_mid][0] < 10:
+                    return type(self)._seen_msgs[_mid][1]
+        except Exception:
+            pass
         mtype = data.get("msgtype", "")
         user = (data.get("from") or {}).get("userid", "")
         resp_url = data.get("response_url", "")
@@ -233,11 +254,27 @@ class TenantBot:
                             reply = f"⚠️ 文件解析失败：{e}"
                             info = None
                         if info:
-                            # 工期：文件提取到就用；没有默认 3 个月（1 个月节点分布太密集看着乱）
-                            dur = info.get('duration') or 3
-                            text = f"新建项目：{info.get('name')}，合同{info.get('amount') or 0}万，工期{dur}个月，负责人{info.get('owner') or '老板'}"
-                            reply = ae.handle_message(text, group_id=chatid or f"dm:{user}", who=user)
-                            reply = f"📊 已从「{fname2}」识别项目信息并创建：\n{reply}"
+                            # 去重：同名项目已存在则绑定现有，不重复建
+                            gid2 = chatid or f"dm:{user}"
+                            db3 = ae.get_db()
+                            dup = db3.execute("SELECT id FROM projects WHERE name=? AND status='active'", (info.get('name'),)).fetchone()
+                            if dup:
+                                # 更新绑定到现有项目
+                                bind = db3.execute("SELECT id FROM group_bindings WHERE group_id=?", (gid2,)).fetchone()
+                                if bind:
+                                    db3.execute("UPDATE group_bindings SET project_id=? WHERE group_id=?", (dup["id"], gid2))
+                                else:
+                                    db3.execute("INSERT INTO group_bindings (group_id,project_id) VALUES (?,?)", (gid2, dup["id"]))
+                                db3.commit()
+                                db3.close()
+                                reply = f"📊 项目「{info.get('name')}」已存在（无需重复创建）——已绑定此群。\n发「节点状态」或「有什么风险」开始管理。"
+                            else:
+                                db3.close()
+                                # 工期：文件提取到就用；没有默认 3 个月（1 个月节点分布太密集看着乱）
+                                dur = info.get('duration') or 3
+                                text = f"新建项目：{info.get('name')}，合同{info.get('amount') or 0}万，工期{dur}个月，负责人{info.get('owner') or '老板'}"
+                                reply = ae.handle_message(text, group_id=gid2, who=user)
+                                reply = f"📊 已从「{fname2}」识别项目信息并创建：\n{reply}"
                         else:
                             # 没匹配到固定字段——读全表内容 + LLM 智能分析（不限于指定格式）
                             reply = self._analyze_file_content(path, fname2)
