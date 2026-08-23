@@ -152,6 +152,10 @@ def get_db():
     except sqlite3.OperationalError:
         pass
     try:
+        db.execute("ALTER TABLE projects ADD COLUMN finished_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
         db.execute("ALTER TABLE project_docs ADD COLUMN guide_done INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
@@ -435,6 +439,11 @@ def _handle(db, msg, who, project_id, group_id):
     # ⑤ 行业知识库：类别清单（精确命令提前——建档中也能查）
     if msg.strip() in ("知识库", "行业知识", "有什么知识", "知识库有哪些"):
         return kb_list()
+    # 项目总结/结束（合同结束输出存档材料）——提前于建档拦截（建档中也可触发）
+    if any(k in msg for k in ["项目总结", "总结材料", "复盘报告", "项目复盘", "复盘一下"]):
+        return llm_review(project_id, mark_done=False)
+    if any(k in msg for k in ["项目结束", "合同结束", "完成项目", "项目完结", "完工了", "完工"]):
+        return llm_review(project_id, mark_done=True)
 
     # ---- 建档中：资料匹配优先（合同/图纸/工期等建档步骤不能被 LLM 吞掉）----
     if project_id:
@@ -528,8 +537,13 @@ def _handle(db, msg, who, project_id, group_id):
     pid = proj["id"] if proj else project_id
     amount = extract_amount(msg)
 
+    # 命令词：项目总结/复盘（合同结束输出存档材料）——放诊断前
+    if any(k in msg for k in ["项目总结", "总结材料", "复盘报告", "项目复盘", "复盘一下"]):
+        return llm_review(pid, mark_done=False)
+    if any(k in msg for k in ["项目结束", "合同结束", "完成项目", "项目完结", "完工了", "完工"]):
+        return llm_review(pid, mark_done=True)
     # 命令词：诊断/周报/复盘 → 大模型生成
-    if any(k in msg for k in ["诊断", "分析一下", "帮我看看这个项目", "亏了", "复盘", "哪里亏", "哪亏", "为什么亏"]):
+    if any(k in msg for k in ["诊断", "分析一下", "帮我看看这个项目", "亏了", "哪里亏", "哪亏", "为什么亏"]):
         return llm_diagnose(pid)
     if any(k in msg for k in ["生成周报", "周报", "写周报", "出一份周报"]):
         return llm_report(pid)
@@ -1198,6 +1212,82 @@ def query_respond(pid, msg):
     if issues:
         lines.append("· 🚨 最近问题：" + " / ".join(i["subject"][:20] for i in issues))
     return "\n".join(lines)
+
+# ---------- 项目总结材料（复盘顾问：合同结束输出存档材料） ----------
+def llm_review(pid, mark_done=False):
+    """项目总结材料：拉全量数据（记录/节点/签证/材料/回款/风险）→ LLM 生成结构化总结 → 存文件"""
+    if not LLM_AVAILABLE:
+        return "⚠️ 大模型未配置"
+    db = get_db()
+    try:
+        proj = dict(db.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone() or {})
+        if not proj:
+            return "⚠️ 还没有项目——先报一个"
+        pname = proj.get("name", "项目")
+        events = [dict(r) for r in db.execute(
+            "SELECT * FROM events WHERE project_id=? ORDER BY id", (pid,)).fetchall()]
+        ms = [dict(r) for r in db.execute(
+            "SELECT stage, plan_date, status, note FROM project_milestones WHERE project_id=? ORDER BY plan_date", (pid,)).fetchall()]
+        visas = [dict(r) for r in db.execute(
+            "SELECT title, amount, status FROM visa_records WHERE project_id=?", (pid,)).fetchall()]
+        mats = [dict(r) for r in db.execute(
+            "SELECT name, qty, unit, price, arrived FROM material_ledger WHERE project_id=?", (pid,)).fetchall()]
+        ps = [dict(r) for r in db.execute(
+            "SELECT stage, amount, due_date, status FROM payment_schedule WHERE project_id=?", (pid,)).fetchall()]
+        alerts = [dict(r) for r in db.execute(
+            "SELECT content, severity, status, created_at FROM alerts WHERE project_id=? ORDER BY id", (pid,)).fetchall()]
+        if mark_done:
+            db.execute("UPDATE projects SET status='done', finished_at=datetime('now','localtime') WHERE id=?", (pid,))
+            db.commit()
+    finally:
+        db.close()
+    ev_txt = "\n".join(f"- [{e.get('created_at','')[:10]}][{e.get('event_type','')}]{e.get('who','')}：{e.get('subject','')[:60]}" for e in events) or "（无）"
+    ms_txt = "\n".join(f"- {m['stage']}：计划{m['plan_date']}，状态{m['status']}" + (f"，{m['note']}" if m.get("note") else "") for m in ms) or "（无）"
+    visa_txt = "\n".join(f"- {v['title']}" + (f"（{v['amount']/10000:.1f}万）" if v.get("amount") else "") + f"【{v['status']}】" for v in visas) or "（无）"
+    mat_txt = "\n".join(f"- {m['name']}" + (f" {m['qty']:g}{m['unit']}" if m.get("qty") else "") + (f" ×{m['price']:g}元" if m.get("price") else "") + ("✅已到" if m.get("arrived") else "⏳未到") for m in mats) or "（无）"
+    ps_txt = "\n".join(f"- {p['stage']}：{p['amount']/10000:.1f}万，应到{p['due_date']}，{p['status']}" for p in ps) or "（无）"
+    alert_txt = "\n".join(f"- [{a['created_at'][:10]}]{'🔴' if a.get('severity')=='critical' else '🟠'}{a['content'][:50]}（{a['status']}）" for a in alerts) or "（无）"
+    prompt = f"""你是资深工程项目复盘顾问。项目「{pname}」已结束，请输出一份**项目总结材料**（给老板存档/交接用）：
+【基本信息】合同 {proj.get('contract',0)/10000:.1f} 万，已收 {proj.get('received',0)/10000:.1f} 万，负责人 {proj.get('manager') or '未填'}，工程类型 {proj.get('ptype') or '通用'}
+【项目记录】
+{ev_txt}
+【节点计划】
+{ms_txt}
+【回款计划】
+{ps_txt}
+【签证台账】
+{visa_txt}
+【材料台账】
+{mat_txt}
+【风险记录】
+{alert_txt}
+总结材料结构（markdown，清晰可存档）：
+# 📋 项目总结：{pname}
+## 一、项目概览（基本信息/合同/结算）
+## 二、执行回顾（进度 vs 计划、关键节点达成情况）
+## 三、财务结算（合同/已收/应收/逾期/签证增项）
+## 四、变更与签证（汇总 + 未签风险提示）
+## 五、问题与风险回顾（发生的问题、处理结果）
+## 六、经验教训（哪做得好/哪亏了/哪慢了 + 下次怎么避）
+## 七、资产沉淀（材料/供应商评价，供下次项目参考）
+要求：全部基于以上数据，数字准确，不编造；经验教训给具体可执行建议。800字内。"""
+    resp = advisor_llm.chat([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=1200)
+    if not resp or resp.startswith("__LLM_ERROR__"):
+        return "⚠️ 总结生成失败（大模型无响应）"
+    saved = ""
+    try:
+        sdir = os.path.join(os.path.dirname(os.path.expanduser(DB_PATH)), "project_reviews")
+        os.makedirs(sdir, exist_ok=True)
+        fname = f"{pname}_{datetime.now().strftime('%Y%m%d')}.md"
+        fpath = os.path.join(sdir, fname)
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(resp)
+        saved = f"\n\n📁 已存档：{fpath}"
+    except Exception:
+        saved = ""
+    head = "🏁 **项目已标记完成！**\n\n" if mark_done else "📋 项目总结材料：\n\n"
+    return head + resp + saved
+
 
 # ---------- 每日巡检（主动预警） ----------
 def llm_diagnose(pid):
