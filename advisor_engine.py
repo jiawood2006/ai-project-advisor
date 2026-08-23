@@ -455,8 +455,8 @@ def _handle(db, msg, who, project_id, group_id):
             if ("提供资料" in msg) or ("已提供" in msg):
                 return provide_doc(db, msg, project_id)
 
-    # ---- 建档中：行业知识强词直接回答（不被 LLM 分支吞掉，省 token）----
-    _kb_direct = kb_answer(msg)
+    # ---- 建档中：行业知识直答（纯行业问题，不抢项目问题；省 token）----
+    _kb_direct = _kb_direct_answer(msg)
     if _kb_direct:
         return _kb_direct
 
@@ -604,7 +604,7 @@ def _handle(db, msg, who, project_id, group_id):
     # ⑤ 行业知识库：清单/直接问答（放顾问命令之后——不抢项目分析）
     if msg.strip() in ("知识库", "行业知识", "有什么知识", "知识库有哪些"):
         return kb_list()
-    _kb = kb_answer(msg)
+    _kb = _kb_direct_answer(msg)
     if _kb:
         return _kb
 
@@ -890,6 +890,18 @@ def kb_search(msg, limit=3):
         return rows[:limit]
     except Exception:
         return []
+
+# 项目语境词：含这些词的消息视为项目问题（优先 LLM 结合项目数据回答，不走行业知识直答）
+_PROJ_CTX_WORDS = ("节点", "验收", "交付", "计划", "时间", "进度", "状态", "这个", "我们", "项目",
+                   "付款", "回款", "收款", "签证", "材料", "合同", "工期", "什么时候", "不对",
+                   "对不对", "怎么算", "怎么安排", "为什么")
+
+def _kb_direct_answer(msg):
+    """行业知识直答——仅纯行业问题（不含项目语境词）；项目问题交给 LLM 结合项目数据"""
+    if any(w in msg for w in _PROJ_CTX_WORDS):
+        return None
+    return kb_answer(msg)
+
 
 def kb_answer(msg):
     """行业知识直接问答（强知识词命中→直接返回，省 token）"""
