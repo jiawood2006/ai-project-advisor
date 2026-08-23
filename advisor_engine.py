@@ -455,6 +455,11 @@ def _handle(db, msg, who, project_id, group_id):
             if ("提供资料" in msg) or ("已提供" in msg):
                 return provide_doc(db, msg, project_id)
 
+    # ---- 建档中：行业知识强词直接回答（不被 LLM 分支吞掉，省 token）----
+    _kb_direct = kb_answer(msg)
+    if _kb_direct:
+        return _kb_direct
+
     # ---- LLM 智能理解优先（核心：自由对话，不被框架限制）----
     # 一次调用：判断意图 + 直接生成回答；命令类分发到专业模块
     if LLM_AVAILABLE and project_id:
