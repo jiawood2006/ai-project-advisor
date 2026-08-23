@@ -277,6 +277,7 @@ def create_project(db, msg, group_id):
         ms = generate_milestones(db, pid, float(months), ptype=ptype)
         resp += f"\n\n📅 **已生成节点计划**（按 {months} 个月" + (f"，检测到**{ptype}工程**流程" if ptype else "") + "）：\n"
         resp += "\n".join(f"· {s}：{d}" for s, d in ms)
+        resp += f"\n\n📏 节点日期依据：合同/甲方未明确节点时，按**工期 {months} 个月 × {ptype or '行业'}阶段比例**自动暂定排布。如与实际不符，发「改节点：阶段 新日期」调整。"
         resp += "\n（发「节点：完成 施工实施」更新状态）"
     else:
         resp += "\n\n⚠️ 缺少工期计划——节点无法确认（建档第 3 步可补）。"
@@ -297,7 +298,10 @@ ONBOARDING_HINTS = {
 ONBOARDING_DOCS = ["合同/中标通知书", "施工图纸", "工期计划/节点", "付款节点（比例%）", "供应商/施工队名单", "负责人/对接人"]
 
 def match_onboarding(msg):
-    """把客户回复匹配到建档步骤"""
+    """把客户回复匹配到建档步骤——提问/质疑不触发（区分提供资料 vs 提问）"""
+    # 提问/质疑类消息不触发建档匹配（问"怎么判断/根据什么/为什么"等是提问，不是提供资料）
+    if any(k in msg for k in ["怎么", "如何", "为什么", "根据什么", "依据", "判断", "没有", "不对", "？", "?", "是否"]):
+        return None
     if any(k in msg for k in ["工期", "个月"]):
         return 3
     if any(k in msg for k in ["合同", "中标"]):
@@ -408,6 +412,16 @@ def _handle(db, msg, who, project_id, group_id):
         return milestones_status(db, project_id)
     if "节点：完成" in msg or "节点:完成" in msg:
         return milestone_done(db, msg, project_id)
+    # 改节点：改节点：验收交付 2027-01-20（合同/实际有明确节点时按实调整）
+    _rm = re.match(r"改节点[:：]\s*(.+?)\s+(\d{4}-\d{1,2}-\d{1,2})", msg)
+    if _rm:
+        _sn, _nd = _rm.group(1).strip(), _rm.group(2)
+        n = db.execute("UPDATE project_milestones SET plan_date=?, status='pending' WHERE project_id=? AND stage LIKE ?",
+                       (_nd, project_id, f"%{_sn}%"))
+        db.commit()
+        if n.rowcount:
+            return f"✅ 节点「{_sn}」已改为 {_nd}（按实际约定调整）——发「节点状态」查看"
+        return f"⚠️ 没找到节点「{_sn}」——发「节点状态」看有哪些节点"
     if "工期" in msg and "个月" in msg:
         return add_milestones(db, msg, project_id)
     # ---- 建档命令 ----
@@ -479,6 +493,7 @@ def _handle(db, msg, who, project_id, group_id):
 {_ct_txt}
 项目记录：{_ev_txt}
 节点计划：{_ms_txt}
+（节点日期说明：合同/甲方未明确节点时，节点为按工期×阶段比例自动暂定，非合同约定；如客户问节点依据，如实说明并按合同/实际调整）
 行业知识（相关时引用并注明出处）：
 {kb_txt}
 客户发来消息。请【基于合同文本和项目数据正面回答】，规则：
