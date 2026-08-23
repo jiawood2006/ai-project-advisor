@@ -20,7 +20,7 @@
   单聊：FromUserName（员工）→ 引擎 group_id=单聊标识（客户默认项目）
   群聊：ChatId（群）→ 引擎 group_id=群ID（群↔项目绑定）
 """
-import os, sys, json, time, base64, hashlib, threading
+import os, sys, json, time, base64, hashlib, threading, re
 import xml.etree.ElementTree as ET
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -152,13 +152,17 @@ class TenantBot:
         # 切到该客户数据库
         ae.set_db_path(self.cfg["db"])
         if chat_id:
-            # 群聊：群标识=项目（群绑定由「绑定项目：XXX」或首次消息引导）
-            reply = ae.handle_message(content, group_id=chat_id, who=user)
-            # MVP：回复触发人（群内刷屏回复后续优化——企微应用发普通群受限）
+            # 群聊：静默记录（不刷屏）——消息自动存档 events，节点/回款/风险/承诺自动更新
+            # 老板交互走智能机器人（@触发）；自建应用群里不回复
             try:
-                self.send_text(user, f"📌 已记入项目群：{reply}")
+                ae.handle_message(content, group_id=chat_id, who=user)
             except Exception as e:
-                print(f"群回复失败: {e}")
+                try:
+                    with open("/tmp/wecom_bot_debug.log", "a") as f:
+                        f.write(f"{time.strftime('%m-%d %H:%M:%S')} [群静默记录异常] {e}\n")
+                except Exception:
+                    pass
+            return "success"
         else:
             # 单聊：用员工标识作为群ID（客户默认项目）
             reply = ae.handle_message(content, group_id=f"dm:{user}", who=user)
@@ -277,7 +281,7 @@ class TenantBot:
                                 reply = f"📊 已从「{fname2}」识别项目信息并创建：\n{reply}"
                         else:
                             # 没匹配到固定字段——读全表内容 + LLM 智能分析（不限于指定格式）
-                            reply = self._analyze_file_content(path, fname2)
+                            reply = self._analyze_file_content(path, fname2, chatid, user)
                         # 存合同/文档全文（供风险评估/记忆调用）——长文本视为合同/方案
                         try:
                             rows_t = read_excel_rows(path)
@@ -317,8 +321,14 @@ class TenantBot:
                 reply = f"⚠️ 图片处理异常：{e}"
         elif mtype == "text":
             content = (data.get("text") or {}).get("content", "") if isinstance(data.get("text"), dict) else str(data.get("text", ""))
+            # 剥掉 @机器人 前缀（群里@触发时 content 可能带 @机器人名，如 "@智能机器人AI助手 进度怎么样"）
+            content = re.sub(r'^@[^\s:：，,]{1,20}\s*[:：]?\s*', '', content).strip()
             gid = chatid or f"dm:{user}"
-            reply = ae.handle_message(content, group_id=gid, who=user)
+            if chatid and not content:
+                # 群聊纯@无实质内容——不回复（空 stream 企微不展示）
+                reply = ""
+            else:
+                reply = ae.handle_message(content, group_id=gid, who=user)
         else:
             reply = "✅ 已收到"
         # 回复：智能机器人要求回调响应体返回【加密 JSON】（msgtype=stream）
@@ -402,8 +412,8 @@ class TenantBot:
                 pass
         return f"收到图片——识别到内容：{text[:100]}"
 
-    def _analyze_file_content(self, path, fname):
-        """读取 Excel 全部内容 → LLM 智能分析（不限于固定字段；xlsx/xls 均支持）"""
+    def _analyze_file_content(self, path, fname, chatid=None, user=""):
+        """读取文件全部内容 → LLM 结构化提取（项目名/金额/工期/节点）→ 建项目 + 按文件节点覆盖"""
         try:
             rows = read_excel_rows(path)
             lines = []
@@ -416,12 +426,52 @@ class TenantBot:
                 return f"收到文件「{fname}」——文件内容为空或无法读取"
             import advisor_llm
             prompt = (
-                f"你是工程项目顾问。客户发来文件「{fname}」，Excel 内容如下：\n{sample}\n\n"
-                "请智能分析：1）这是什么文件、什么内容（例如电器清单/合同/进度表） 2）能提取到什么项目信息"
-                "（项目名称/合同金额/工期/负责人/工程类型等，有就列出，没有就直说） 3）给出简要评估和下一步建议。"
-                "用中文，简洁专业，500字以内。"
+                f"你是工程项目顾问。客户发来文件「{fname}」，内容如下：\n{sample}\n\n"
+                "请提取项目信息，**只输出 JSON**（不要多余文字）：\n"
+                '{"name": "项目名称", "amount": 合同金额万元(数字), "duration": 工期月(数字), '
+                '"owner": "负责人", "milestones": [{"stage": "节点名称", "date": "YYYY-MM-DD"}]}\n'
+                "规则：\n"
+                "- 没有的信息用 null；name 必须有才建项目\n"
+                "- 如果文件里有节点/里程碑/进度计划/施工计划（含日期），提取为 milestones（按顺序）；没有则 []\n"
+                "- 金额统一换算成万元（如 3440324 元 → 344.03）\n"
+                "- 日期统一 YYYY-MM-DD"
             )
-            resp = advisor_llm.chat([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=800)
+            resp = advisor_llm.chat([{"role": "user", "content": prompt}], temperature=0.1, max_tokens=900)
+            info = None
+            if resp and not resp.startswith("__LLM_ERROR__"):
+                try:
+                    import json as _json, re as _re
+                    m = _re.search(r"\{.*\}", resp, _re.S)
+                    if m:
+                        info = _json.loads(m.group())
+                except Exception:
+                    info = None
+            # 有项目名 → 建项目（节点按文件覆盖）
+            if info and info.get("name"):
+                gid = chatid or f"dm:{user}"
+                dur = info.get("duration") or 3
+                text = f"新建项目：{info['name']}，合同{info.get('amount') or 0}万，工期{dur}个月，负责人{info.get('owner') or '老板'}"
+                reply = ae.handle_message(text, group_id=gid, who=user)
+                # 文件里有节点 → 覆盖默认测算节点（依据文件）
+                ms = info.get("milestones") or []
+                if ms:
+                    try:
+                        db = ae.get_db()
+                        binding = db.execute("SELECT project_id FROM group_bindings WHERE group_id=?", (gid,)).fetchone()
+                        if binding:
+                            db.execute("DELETE FROM project_milestones WHERE project_id=?", (binding["project_id"],))
+                            for x in ms:
+                                if x.get("stage") and x.get("date"):
+                                    db.execute("INSERT INTO project_milestones (project_id, stage, plan_date, note) VALUES (?,?,?,?)",
+                                               (binding["project_id"], x["stage"], x["date"], "依据文件"))
+                            db.commit()
+                        db.close()
+                        reply += f"\n\n📅 已按文件提取 {len(ms)} 个节点（替代默认测算）：\n"
+                        reply += "\n".join(f"· {x['stage']}：{x['date']}" for x in ms if x.get("stage") and x.get("date"))
+                    except Exception:
+                        pass
+                return reply
+            # 没建项目 → 返回分析文本
             if resp and not resp.startswith("__LLM_ERROR__"):
                 return f"📄 已分析「{fname}」：\n{resp}"
             return f"收到文件「{fname}」——已读取内容，正在分析..."
