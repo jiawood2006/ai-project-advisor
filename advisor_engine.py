@@ -156,6 +156,10 @@ def get_db():
     except sqlite3.OperationalError:
         pass
     try:
+        db.execute("ALTER TABLE projects ADD COLUMN months REAL")
+    except sqlite3.OperationalError:
+        pass
+    try:
         db.execute("ALTER TABLE project_docs ADD COLUMN guide_done INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
@@ -274,13 +278,9 @@ def create_project(db, msg, group_id):
     resp += "。"
     if months:
         resp += f"工期 {months} 个月。"
-        ms = generate_milestones(db, pid, float(months), ptype=ptype)
-        resp += f"\n\n📅 **已生成节点计划**（按 {months} 个月" + (f"，检测到**{ptype}工程**流程" if ptype else "") + "）：\n"
-        resp += "\n".join(f"· {s}：{d}" for s, d in ms)
-        resp += f"\n\n📏 节点日期依据：合同/甲方未明确节点时，按**工期 {months} 个月 × {ptype or '行业'}阶段比例**自动暂定排布。如与实际不符，发「改节点：阶段 新日期」调整。"
-        resp += "\n（发「节点：完成 施工实施」更新状态）"
+        resp += f"\n\n📅 **请提供节点时间规划**：\n- 合同/文件里有节点的直接发文件（自动标注）\n- 或逐条说「节点：阶段 日期」，如：\n  节点：深化设计 2026-09-10\n  节点：验收交付 2026-12-30"
     else:
-        resp += "\n\n⚠️ 缺少工期计划——节点无法确认（建档第 3 步可补）。"
+        resp += "\n\n⚠️ 缺少工期计划——请补充（建档第 3 步，如「工期3个月」）。"
     db.commit()
     resp += "\n\n🎯 **开始基础资料建档**（我一步步引导，答一步走一步）：\n"
     resp += onboarding_next(db, pid)
@@ -290,7 +290,7 @@ def create_project(db, msg, group_id):
 ONBOARDING_HINTS = {
     1: "发文件，或说：合同80万，月结",
     2: "发文件即可（施工图/效果图/节点图）",
-    3: "如：工期3个月（我会自动生成节点计划）",
+    3: "如：工期3个月（节点规划请按「节点：阶段 日期」提供，或发文件）",
     4: "如：首款30%，进度款按月，尾款10%",
     5: "如：XX建材、XX施工队",
     6: "如：负责人王经理，甲方对接人李工",
@@ -355,9 +355,8 @@ def onboarding_complete_step(db, msg, pid, step_no):
     if step_no == 3:
         m = re.search(r'(\d+(?:\.\d+)?)\s*个月', msg)
         if m:
-            db.execute("DELETE FROM project_milestones WHERE project_id=?", (pid,))
-            ms = generate_milestones(db, pid, float(m.group(1)))
-            extra = "📅 节点计划已生成：" + "，".join(f"{n} {d}" for n, d in ms[:3]) + "..."
+            db.execute("UPDATE projects SET months=? WHERE id=?", (float(m.group(1)), pid))
+            extra = f"📅 工期已记录 {m.group(1)} 个月——请提供**节点时间规划**（发文件自动标注，或逐条说「节点：阶段 日期」）"
     if step_no == 4:
         # 付款节点（比例%）→ 生成回款计划表
         extra = build_payment_schedule(db, pid, msg)
@@ -412,6 +411,21 @@ def _handle(db, msg, who, project_id, group_id):
         return milestones_status(db, project_id)
     if "节点：完成" in msg or "节点:完成" in msg:
         return milestone_done(db, msg, project_id)
+    # 录入/改节点：节点：阶段 日期（客户提供节点规划——机器人不自行规划）
+    _nm = re.match(r"节点[:：]\s*(.+?)\s+(\d{4}-\d{1,2}-\d{1,2})", msg)
+    if _nm and not any(k in msg for k in ["付款", "支付"]):
+        _sn, _nd = _nm.group(1).strip(), _nm.group(2)
+        if "完成" in _sn:
+            return milestone_done(db, msg, project_id)
+        n = db.execute("UPDATE project_milestones SET plan_date=? WHERE project_id=? AND stage LIKE ?",
+                       (_nd, project_id, f"%{_sn}%"))
+        db.commit()
+        if n.rowcount:
+            return f"✅ 节点「{_sn}」已设为 {_nd}"
+        db.execute("INSERT INTO project_milestones (project_id, stage, plan_date, note) VALUES (?,?,?,?)",
+                   (project_id, _sn, _nd, "客户提供"))
+        db.commit()
+        return f"✅ 已记录节点「{_sn}」：{_nd}"
     # 改节点：改节点：验收交付 2027-01-20（合同/实际有明确节点时按实调整）
     _rm = re.match(r"改节点[:：]\s*(.+?)\s+(\d{4}-\d{1,2}-\d{1,2})", msg)
     if _rm:
@@ -493,7 +507,7 @@ def _handle(db, msg, who, project_id, group_id):
 {_ct_txt}
 项目记录：{_ev_txt}
 节点计划：{_ms_txt}
-（节点日期说明：合同/甲方未明确节点时，节点为按工期×阶段比例自动暂定，非合同约定；如客户问节点依据，如实说明并按合同/实际调整）
+（节点说明：节点由客户/合同/文件提供，机器人不自行规划；合同/文件有节点按标注执行，没有的节点提醒客户补充说明日期）
 行业知识（相关时引用并注明出处）：
 {kb_txt}
 客户发来消息。请【基于合同文本和项目数据正面回答】，规则：
@@ -1479,7 +1493,7 @@ def milestones_status(db, pid):
         return "⚠️ 请先在项目群里操作"
     rows = [dict(r) for r in db.execute("SELECT * FROM project_milestones WHERE project_id=? ORDER BY plan_date", (pid,))]
     if not rows:
-        return "⚠️ 还没有节点计划——请提供工期（如「工期3个月」）——否则顾问无法按节点提醒"
+        return "⚠️ 还没有节点计划——请提供节点时间规划（发文件自动标注，或逐条说「节点：阶段 日期」，如：节点：深化设计 2026-09-10）"
     today = datetime.now().strftime("%Y-%m-%d")
     done = sum(1 for r in rows if r["status"] == "done")
     pct = int(done / len(rows) * 100)
@@ -1501,20 +1515,19 @@ def milestones_status(db, pid):
     return "\n".join(lines)
 
 def add_milestones(db, msg, pid):
-    """补充工期 → 生成节点计划"""
+    """补充工期 → 记录工期，提醒提供节点规划（机器人不自行规划节点）"""
     if not pid:
         return "⚠️ 请先在项目群里操作"
     m = re.search(r'工期[：:]?\s*(\d+(?:\.\d+)?)\s*个月', msg)
     if not m:
         return "⚠️ 请提供工期：如「工期3个月」"
-    db.execute("DELETE FROM project_milestones WHERE project_id=?", (pid,))
-    proj = db.execute("SELECT name,ptype FROM projects WHERE id=?", (pid,)).fetchone()
-    ptype = infer_ptype(proj["name"] if proj else "") or (proj["ptype"] if proj and proj["ptype"] else None)
-    rows = generate_milestones(db, pid, float(m.group(1)), ptype=ptype)
+    months = float(m.group(1))
+    db.execute("UPDATE projects SET months=? WHERE id=?", (months, pid))
     db.execute("UPDATE project_docs SET status='provided', provided_at=datetime('now','localtime') WHERE project_id=? AND doc_name LIKE '%工期%'", (pid,))
     db.execute("UPDATE project_docs SET guide_done=1 WHERE project_id=? AND guide_order=3", (pid,))
     db.commit()
-    return "📅 节点计划已生成（按工期 %s 个月" % m.group(1) + ("，**%s工程**流程" % ptype if ptype else "") + "）：\n" + "\n".join(f"· {s}：{d}" for s, d in rows)
+    return (f"✅ 工期已记录 {m.group(1)} 个月。\n"
+            f"📅 请提供**节点时间规划**（合同/文件里有节点发文件自动标注；或逐条说「节点：阶段 日期」，如：节点：深化设计 2026-09-10）")
 
 def milestone_done(db, msg, pid):
     """标记节点完成：节点：完成 施工实施"""
