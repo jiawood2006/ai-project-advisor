@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>工程顾问</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+body { font-family:-apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif; background:#f5f6f7; height:100vh; display:flex; flex-direction:column; }
+.header { background:#2b6cb0; color:#fff; padding:12px 16px; display:flex; align-items:center; gap:10px; box-shadow:0 1px 3px rgba(0,0,0,.15); }
+.header .avatar { width:38px; height:38px; border-radius:50%; background:#fff; display:flex; align-items:center; justify-content:center; font-size:20px; }
+.header .title { flex:1; }
+.header .title .name { font-size:16px; font-weight:600; }
+.header .title .sub { font-size:11px; opacity:.85; }
+.chat { flex:1; overflow-y:auto; padding:16px 14px; background:#f5f6f7; }
+.msg { display:flex; margin-bottom:14px; }
+.msg .bubble { max-width:76%; padding:10px 14px; border-radius:12px; font-size:15px; line-height:1.55; word-break:break-word; white-space:pre-wrap; }
+.msg.bot .bubble { background:#fff; border-top-left-radius:4px; box-shadow:0 1px 2px rgba(0,0,0,.06); }
+.msg.user { justify-content:flex-end; }
+.msg.user .bubble { background:#95ec69; border-top-right-radius:4px; }
+.input-bar { background:#fff; border-top:1px solid #e5e5e5; padding:10px 12px; display:flex; gap:8px; align-items:flex-end; }
+.input-bar textarea { flex:1; border:1px solid #ddd; border-radius:8px; padding:9px 12px; font-size:15px; resize:none; height:42px; max-height:120px; outline:none; font-family:inherit; }
+.input-bar button { background:#2b6cb0; color:#fff; border:none; border-radius:8px; padding:0 20px; height:42px; font-size:15px; font-weight:500; }
+.input-bar button:active { opacity:.85; }
+.tip { text-align:center; color:#999; font-size:12px; padding:8px 0 4px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="avatar">🏗️</div>
+  <div class="title">
+    <div class="name">工程顾问</div>
+    <div class="sub">记录 · 盯进度 · 风险提醒</div>
+  </div>
+</div>
+
+<div class="chat" id="chat">
+  <div class="msg bot"><div class="bubble">你好，我是你的工程顾问 👋<br><br>把项目情况发给我就行，比如：<br>· 「新建项目：XX大厦装修，合同80万」<br>· 「刚收了进度款20万」<br>· 「甲方答应明天付尾款」<br><br>我会记录、提醒，帮你盯着风险。</div></div>
+</div>
+
+<div class="tip">消息会记录到你的项目档案 · 数据安全</div>
+
+<div class="input-bar">
+  <textarea id="input" placeholder="输入消息…" rows="1"></textarea>
+  <button id="send">发送</button>
+</div>
+
+<script>
+const GROUP_ID = "__GROUP_ID__";
+const TOKEN = "__TOKEN__";
+const BASE = "__BASE__";      // 反代子路径（部署在 /scan 下时用）
+const chat = document.getElementById("chat");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+
+function addMsg(text, isUser) {
+  const div = document.createElement("div");
+  div.className = "msg " + (isUser ? "user" : "bot");
+  const b = document.createElement("div");
+  b.className = "bubble";
+  b.textContent = text;
+  div.appendChild(b);
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+async function send() {
+  const msg = input.value.trim();
+  if (!msg) return;
+  addMsg(msg, true);
+  input.value = "";
+  input.style.height = "42px";
+  const wait = document.createElement("div");
+  wait.className = "msg bot";
+  wait.innerHTML = '<div class="bubble">…</div>';
+  chat.appendChild(wait);
+  chat.scrollTop = chat.scrollHeight;
+  try {
+    const res = await fetch(BASE + "/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ msg, group_id: GROUP_ID, token: TOKEN })
+    });
+    const data = await res.json();
+    wait.remove();
+    addMsg(data.reply || "(无回复)", false);
+  } catch (e) {
+    wait.remove();
+    addMsg("⚠️ 网络异常，请重试", false);
+  }
+}
+
+sendBtn.addEventListener("click", send);
+input.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+input.addEventListener("input", () => {
+  input.style.height = "42px";
+  input.style.height = Math.min(input.scrollHeight, 120) + "px";
+});
+</script>
+</body>
+</html>
