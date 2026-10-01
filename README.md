@@ -1,5 +1,10 @@
 # 工程项目 AI 顾问 · AI Project Advisor
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org)
+[![Platform](https://img.shields.io/badge/platform-%E4%BC%81%E5%BE%AE%20%7C%20%E9%92%89%E9%92%89%20%7C%20H5-07C160)](README.md)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](README.md)
+
 **把 AI 顾问装进企业微信/钉钉：项目群里正常说话，它负责记录一切、盯节点、盯回款、提醒风险、出报告。**
 
 不是软件，没有菜单按钮——会用企业微信就会用。记录用文字/语音/图片随手发，顾问在后台把内容变成结构化档案，并且**每天主动找您一次**（早报/日报/预警）。
@@ -103,6 +108,10 @@ watches deadlines and receivables, pushes a daily briefing, and answers question
 the original conversation. Rule-engine first (zero tokens) with an LLM fallback; a reversible masking
 layer strips phones/amounts/orgs/names before anything leaves the box; one SQLite DB per tenant behind a
 unified multi-platform gateway (WeCom app/bot, DingTalk, H5).
+
+---
+
+**如果这个项目对你有用，欢迎点个 ⭐ Star —— 这是我们继续打磨的动力。**
 
 ## License
 
