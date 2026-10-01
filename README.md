@@ -1,119 +1,109 @@
-## English Introduction
+# 工程项目 AI 顾问 · AI Project Advisor
 
-**AI Project Advisor** is a WeChat-based AI assistant for construction / engineering / building projects. It helps project owners and managers run projects by just chatting in WeChat groups — no software to learn, no forms to fill.
+**把 AI 顾问装进企业微信/钉钉：项目群里正常说话，它负责记录一切、盯节点、盯回款、提醒风险、出报告。**
 
-### Key Features
-
-- **Memory Graph (Chat = Archive)**: Every word in your project group is archived automatically — promises, confirmations, payments, changes — with who/when/original message, ready as evidence for payment collection and dispute resolution
-- **Multi-Group Support**: One project per group (WeChat Work group), auto-binding group ↔ project, no data interference between projects; boss chat = global view
-- **Rule + LLM Hybrid Engine**: Daily recording costs zero tokens (rule-based intent recognition); complex understanding / deep diagnosis / report generation use LLM on demand (DeepSeek — cheap)
-- **Risk Radar**: Litigation / key personnel changes / supplier failures — proactive alerts + action checklists (auto web-scan is a paid-tier feature)
-- **8 Advisor Modules**: Progress / Payment / Change / Documentation / Risk / Inspection / Review / Training
-- **Proactive Service**: Daily morning brief, deadline countdown, anomaly detection (overdue payments, missing materials, schedule slippage), one-click reports, voice/photo input
-
-### Quick Start
-
-```bash
-# Python 3 + optional DEEPSEEK_API_KEY (in ~/.hermes/.env or env var)
-python3 advisor_engine.py   # multi-group demo
-python3 advisor_llm.py      # LLM enhancement test (diagnosis/report)
-```
-
-### New in latest version
-
-- **WeCom Smart Bot (企微智能机器人 API 模式)**: FREE channel — receive files/text/images from users, encrypted callback reply (msgtype=stream), file decryption (AESKey)
-- **File Auto-Project (文件智能建项目)**: Upload .xlsx / .xls / Word(.docx) / text — AI extracts project name, contract amount (auto from 合计 row), duration → auto-create project + milestone plan
-- **Contract Risk Assessment (合同风险评估)**: contract text stored on upload → risk advisor analyzes contract clauses / client / project in 3 dimensions with P0/P1 action plan
-- **Photo-to-Ledger (拍照即记账)**: receipts / visa / acceptance photos OCR → auto-record business facts
-- **Speech-to-Data (说话录入)**: "收到进度款20万" → auto-update received amount; changes / promises / issues / progress all auto-recorded
-- **8 Advisor Modules (八大顾问)**: Progress (critical path + catch-up) / Payment (aging + collection) / Change (visa completeness) / Docs / Risk (contract-aware) / Inspection / Review / Training — each with professional framework
-- **Resource Management (资源方管理)**: supplier/team profile, arrival/shortage tracking, efficiency & load alerts
-- **Memory Recall (记忆图谱)**: "回忆一下XX说过什么" — query by person/topic from archived originals
-- **Business Decisions (经营决策)**: profit forecast / cashflow gap / receivable aging / bid evaluation
-- **Proactive Morning Brief (主动预警)**: daily 7:30 cron — milestone due / overdue payment / open risks
-- **Guided Onboarding (引导性建档)**: AI walks the client through 6-step base-doc setup one step at a time
-- **Visa Ledger (签证台账, 2026-08-23)**: "签证：增项吊顶（2.5万）" register → "签证清单" query (pending/signed/paid) → "签证：已签 XX" update; change advisor reads the ledger
-- **Material Ledger (材料台账, 2026-08-23)**: "材料：海尔冰箱 100台 1750元" register (name/qty/price parse) → "材料清单" query → "材料到货：XX" arrival update
-- **Milestones by Project Type (节点按工程类型, 2026-08-23)**: auto-detect weak-current/decoration/installation/civil works from project name → 4 stage templates with real construction flows
-- **Industry Knowledge Base (行业知识库 L1, 2026-08-23)**: 8 categories × 12 entries with legal citations (民法典 807, 司法解释一, 建质〔2017〕138号...) — direct Q&A ("质保金一般留多少") or auto-injected into advisor analysis
-- **Fix: "付款节点" no longer misread as milestone query (付款节点误判修复, 2026-08-23)**
-- **Milestone Plan (节点计划)**: 5-stage schedule with deliverables + progress bar + overdue tracking
-
-### Architecture
+不是软件，没有菜单按钮——会用企业微信就会用。记录用文字/语音/图片随手发，顾问在后台把内容变成结构化档案，并且**每天主动找您一次**（早报/日报/预警）。
 
 ```
-Chat (WeChat Work group)
-  → Rule engine (intent recognition — 0 token)
-  → Memory graph (SQLite: projects/events/group_bindings...)
-  → LLM layer (DeepSeek: complex parsing/diagnosis/reports — on demand)
-  → Proactive push (morning brief / alerts / reminders)
+企微群 · 老板单聊 · 钉钉 · H5 网页
+        │
+        ▼
+适配器层  adapters/{wecom_app, wecom_aibot, dingtalk, h5}
+        │   同客户同库 · msg_id 去重 · 群聊才带 group_id
+        ▼
+统一接入层  gateway/core.py        ← 一客户一租户一 SQLite
+        │
+        ▼
+脱敏中间层  masking.py             ← 手机号/金额/单位/人名 → 占位符，本地金库可逆
+        │
+        ▼
+顾问引擎  advisor_engine.py
+   ├─ 规则命令层（建档/节点/签证/材料/回款…）  ← 不调大模型，零 token
+   ├─ 记忆图谱（项目-事件-承诺-资源方，可回溯"谁在什么时候说了什么"）
+   ├─ 8 个顾问（进度/回款/变更/资料/风险/巡检/复盘/新人）
+   └─ LLM 兜底（自由问答、行业知识注入）
+        │
+        ▼
+回复 / 早报 / 日报 / 驾驶舱看板
 ```
 
-### Free vs Paid
+## 能力
 
-- Free: 3 project groups + recording/reminders + limited daily Q&A
-- Paid: more groups + deep diagnosis / reports / risk radar auto-scan
+| 你能说 | 它做什么 |
+|---|---|
+| 「新建项目：XX大厦装修，合同80万，工期3个月，负责人王经理」 | 6 步建档 → 自动生成付款计划与节点 |
+| 「钢筋验收过了吗？」 | 查档案回答（谁/何时/依据），不看资料不编 |
+| 「回款情况」/「现金流怎么样」 | 应收台账 + 逾期提醒 + 催款话术（附对话依据） |
+| 「签证：外墙增加保温 2.8万」 | 登记签证台账 → 结算前自动提示未签/已签/已付 |
+| 「材料：XX 100台 1750元」/「材料到货」 | 材料台账 + 到货跟踪 + 名称/数量/单价解析 |
+| 「有什么风险」 | 风险雷达：甲方被执行/失信、对接人变动、资源方异常 |
+| 「生成周报」/「项目总结」 | 基于全量数据生成周报、复盘材料并归档 |
+| 群里随手说的承诺 | 自动归档（谁/何时/原话），**换人/赖账时调得出记录** |
 
-MIT License. Star & share if useful!
+- **多租户**：客户各自独立库，A 项目群看不到 B 项目群；老板单聊看全局。
+- **多平台**：企业微信自建应用、企微智能机器人、钉钉、H5 网页版共用同一个引擎与数据模型。
+- **省 token**：命令类走规则引擎（0 token），只有自由问答/总结才调模型；知识库走关键词检索而非向量库。
+- **每日主动**：早报预警 7:30、日报推送 8:00、日报生成 22:00（cron）。
 
----
+## 对外红线（写进 prompt 的硬约束）
 
-# 🏗️ 工程项目 AI 顾问（AI Project Advisor）
+1. **只记录事实、盯节点、提醒风险、给建议** —— 不替客户做商业决策（不比价、不选型、不定价）。
+2. **不自动测算时间节点** —— 只标注合同/文件里写明的、以及客户口述提供的（避免责任风险）。
+3. **需签章成果由持证人签署**（借人不借资质）。
+4. **数据隔离**：一租户一库；对外脱敏后才送模型。
 
-微信对话式工程项目管理助手——**老板不用管项目，AI 替他管**：发现问题、给出方案、自动干活。
+## 目录
 
-## 核心能力
-
-- **记忆图谱（对话即档案）**：群里说的每句话自动存档——承诺/确认/付款/变更——有据可查（清款依据）
-- **多群接入**：一个项目一个群——群↔项目绑定——多项目互不干扰
-- **规则 + 大模型混合**：日常记录零成本（规则引擎），深度诊断/周报按需调大模型（DeepSeek）
-- **风险雷达**：官司负面/人员变动/资源方暴雷——预警+核查清单（自动扫描=收费版）
-- **8 大顾问模块**：进度/回款/变更/资料/风险/巡检/复盘/新人
+```
+advisor_engine.py     顾问引擎（规则命令 + 记忆图谱 + LLM 兜底）
+advisor_llm.py        LLM 调用封装（OpenAI 兼容；key 走环境变量）
+masking.py            脱敏中间层（可逆，本地金库，fail-closed）
+gateway/
+  core.py             统一接入层：租户路由 / 去重 / 分发
+  onboard.py          扫码接入：专属码 → 开通 → 绑定租户
+  adapters/           wecom_app / wecom_aibot / dingtalk / h5
+h5/                   网页版对话页 + 服务
+wecom_bot.py          企业微信机器人（单租户长连接版）
+advisor_alerts.py     早报预警      advisor_daily_summary.py  日报生成/推送
+test_*.py             测试（不调大模型，可离线跑）
+```
 
 ## 快速开始
 
 ```bash
-# 依赖：Python 3 + 可选 DEEPSEEK_API_KEY（~/.hermes/.env 或环境变量）
-python3 advisor_engine.py          # 跑多群演示
-python3 advisor_llm.py             # 测大模型增强（诊断/周报）
+# 引擎自带 sqlite，无第三方依赖；测试可离线跑
+python3 test_advisor.py      # 27 项
+python3 test_gateway.py      # 29 项（4 平台报文 → 同一引擎 → 同一库）
+python3 test_masking.py      # 16 项（脱敏可逆性/不泄漏/一致性/容错）
+python3 test_onboard.py      # 30 项（扫码接入/专属码/限流）
+python3 test_masking_e2e.py  # 2 项（端到端 + 金库权限 600）
 ```
 
-## 使用示例
+实测（2026-10-01）：**5 个测试文件、104 项断言、全部通过**。
 
-```
-老板（群里）：新建项目：XX大厦办公装修，合同80万，已收30%，负责人王经理
-AI：✅ 项目已创建，群已绑定——群里说的自动记录
+配置（环境变量）：
 
-老板（群里）：刚收了进度款20万
-AI：✅ 已记录收款 20 万，累计已收 44 万（合同 80 万）
+| 变量 | 说明 |
+|---|---|
+| `ADVISOR_DB` / 租户 db 路径 | 数据文件位置（默认按租户分库） |
+| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 模型接入（key 只走环境变量，不写死） |
+| `ADVISOR_MASK=0` | 关闭脱敏中间层 |
+| `ASR_FIX_DICT`（见姊妹项目） | 语音转写纠错表 |
 
-老板（群里）：甲方张经理离职了，换了个李工
-AI：⚠️ 人员变动核查清单：签证补签/承诺书面化/增项补签...
+## 文档
 
-老板（群里）：生成周报
-AI：📋 完整周报（进展/问题/回款/计划/风险）
-```
+- [产品介绍（客户试用版）](产品介绍_客户试用版.md) · [产品方案书](产品方案书.md) · [使用说明](使用说明.md)
+- [记忆图谱技术设计](记忆图谱技术设计.md) · [脱敏中间层说明](脱敏中间层_说明.md) · [部署指南](部署指南.md)
 
-## 架构
+## English
 
-```
-对话（企业微信/群）
-  → 规则引擎（意图识别——0 token）
-  → 记忆图谱（SQLite：projects/events/group_bindings...）
-  → 大模型层（DeepSeek：复杂句/诊断/周报——按需）
-  → 主动推送（早报/预警/提醒）
-```
+An AI project advisor that lives inside WeCom/DingTalk: chat normally in a project group and it turns
+messages into structured records (milestones, payments, visa/change orders, material ledgers, promises),
+watches deadlines and receivables, pushes a daily briefing, and answers questions with citations back to
+the original conversation. Rule-engine first (zero tokens) with an LLM fallback; a reversible masking
+layer strips phones/amounts/orgs/names before anything leaves the box; one SQLite DB per tenant behind a
+unified multi-platform gateway (WeCom app/bot, DingTalk, H5).
 
-## 免费版 vs 收费版
+## License
 
-- 免费版：3 个项目群 + 记录/提醒 + 每天限量问答
-- 收费版：更多群数 + 深度诊断/周报/风险雷达自动扫描
-
-## 文件
-
-- `advisor_engine.py` — 核心引擎（意图识别/图谱/多群/预警）
-- `advisor_llm.py` — 大模型增强层（DeepSeek）
-- `记忆图谱技术设计.md` — 数据库设计
-- `产品方案书.md` — 完整产品设计
-
-MIT License
+MIT（见 [LICENSE](LICENSE)）。
