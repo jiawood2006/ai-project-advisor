@@ -1,14 +1,21 @@
-# 凭证/密钥
-*.env
-.ops_tokens
+# 数据与凭据——绝不入库
+tenants/
+*.db
+*.db-journal
+*_tokens.json
+tokens.json
 tenants.json
-data/*.db
-
-# 临时/日志
-/tmp/
+.env
+*.key
+*.pem
+logs/
 *.log
-__pycache__/
-*.pyc
+data/
+cockpit/data/
+daily_summaries/
+project_reviews/
 
-# 下载文件
-advisor_files/
+# 缓存
+__pycache__/
+*.py[cod]
+.DS_Store
