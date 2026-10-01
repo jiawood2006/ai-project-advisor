@@ -95,6 +95,18 @@ python3 test_masking_e2e.py  # 2 项（端到端 + 金库权限 600）
 | `ADVISOR_MASK=0` | 关闭脱敏中间层 |
 | `ASR_FIX_DICT`（见姊妹项目） | 语音转写纠错表 |
 
+## 与 Hermes Agent 的配合
+
+本项目配套一个标准格式的 **Hermes 技能**，装上之后 Hermes Agent 就掌握了本产品的产品规格与技术
+架构（多平台接入层、多租户数据隔离、规则引擎优先的省 token 设计、记忆图谱），可以据此做二次开发、
+部署上线与日常巡检；本项目本身也是在 Hermes Agent 下开发与运维的。
+
+```bash
+hermes skills install jiawood2006/hermes-skills/skills/ai-project-advisor
+```
+
+技能源码：<https://github.com/jiawood2006/hermes-skills/tree/main/skills/ai-project-advisor>
+
 ## 文档
 
 - [产品介绍（客户试用版）](产品介绍_客户试用版.md) · [产品方案书](产品方案书.md) · [使用说明](使用说明.md)
