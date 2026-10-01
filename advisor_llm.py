@@ -26,8 +26,19 @@ def load_key():
 API_URL = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-chat"
 
-def chat(messages, temperature=0.3, max_tokens=1000):
-    """调用 DeepSeek chat"""
+def tenant_scope():
+    """当前租户标识（跟随 advisor_engine.DB_PATH）——不同客户的金库互相隔离，绝不串号"""
+    try:
+        import advisor_engine as E
+        base = os.path.basename(E.DB_PATH).rsplit(".", 1)[0]
+        base = re.sub(r"[^\w\-.\u4e00-\u9fa5]", "_", base)
+        return base or "default"
+    except Exception:
+        return "default"
+
+
+def _chat_raw(messages, temperature=0.3, max_tokens=1000):
+    """底层调用（不做脱敏）—— 不要直接使用，走 chat()"""
     key = load_key()
     if not key:
         return None
@@ -47,8 +58,24 @@ def chat(messages, temperature=0.3, max_tokens=1000):
     except Exception as e:
         return f"__LLM_ERROR__: {e}"
 
+# ---------- 出站脱敏包装（默认开启；设 ADVISOR_MASK=0 可关闭）----------
+try:
+    from masking import safe_chat
+except Exception:                     # 兼容被单独拷贝使用的情况
+    safe_chat = None
+
+def chat(messages, temperature=0.3, max_tokens=1000, project="default"):
+    """所有出站大模型调用的唯一入口。
+    默认先把敏感信息（人名/单位/金额/地址/电话/邮箱）代号化再发送，返回后自动还原；
+    真实值只留在本地金库 ~/.hermes/ai-advisor-vaults/<project>.json（0600）。
+    """
+    if safe_chat is None:
+        return _chat_raw(messages, temperature=temperature, max_tokens=max_tokens)
+    return safe_chat(messages, _chat_raw, project=project,
+                     temperature=temperature, max_tokens=max_tokens)
+
 # ---------- 1. 复杂消息结构化提取 ----------
-def extract_structured(msg, project_names):
+def extract_structured(msg, project_names, project=None):
     """大模型理解复杂句 → JSON（意图+字段）
     返回: {"intent": "...", "who": "...", "amount": null, "subject": "...", "due": null}
     """
@@ -60,7 +87,8 @@ def extract_structured(msg, project_names):
 
 输出格式：
 {{"intent":"意图","project":"项目名或null","who":"说话对象或null","amount":金额数字或null,"subject":"简述","due":"到期日YYYY-MM-DD或null"}}"""
-    resp = chat([{"role": "user", "content": prompt}], temperature=0.1, max_tokens=500)
+    resp = chat([{"role": "user", "content": prompt}], temperature=0.1, max_tokens=500,
+                project=project or tenant_scope())
     if not resp or resp.startswith("__LLM_ERROR__"):
         return None
     m = re.search(r'\{.*\}', resp, re.S)
@@ -72,7 +100,7 @@ def extract_structured(msg, project_names):
         return None
 
 # ---------- 2. 项目诊断 ----------
-def diagnose(project, events):
+def diagnose(project, events, scope=None):
     """深度诊断：进度/成本/回款/风险——分析+建议"""
     prompt = f"""你是资深工程项目管理顾问。基于以下项目数据做诊断，输出中文诊断报告（简洁、结论先行）：
 
@@ -87,11 +115,12 @@ def diagnose(project, events):
 2. 每个问题的原因分析
 3. 具体可执行的建议（老板马上能做的）
 4. 风险预警（回款/进度/材料/人员）"""
-    resp = chat([{"role": "user", "content": prompt}], temperature=0.4, max_tokens=1200)
+    resp = chat([{"role": "user", "content": prompt}], temperature=0.4, max_tokens=1200,
+                project=scope or tenant_scope())
     return resp if resp and not resp.startswith("__LLM_ERROR__") else None
 
 # ---------- 3. 周报生成 ----------
-def generate_report(project, events):
+def generate_report(project, events, scope=None):
     """一键生成项目周报"""
     prompt = f"""你是工程项目管理助理。基于以下数据生成一份简洁的项目周报（中文、markdown 结构）：
 
@@ -107,16 +136,18 @@ def generate_report(project, events):
 ### 回款情况
 ### 下周计划
 ### 风险与建议"""
-    resp = chat([{"role": "user", "content": prompt}], temperature=0.4, max_tokens=1000)
+    resp = chat([{"role": "user", "content": prompt}], temperature=0.4, max_tokens=1000,
+                project=scope or tenant_scope())
     return resp if resp and not resp.startswith("__LLM_ERROR__") else None
 
 # ---------- 4. 意图兜底（规则没识别） ----------
-def intent_fallback(msg):
+def intent_fallback(msg, project=None):
     """规则没命中时——大模型判断意图"""
     prompt = f"""判断这条消息的意图（只输出一个词）：
 「{msg}」
 选项：payment_received/promise/issue/change/person_change/progress/query/report/diagnose/other"""
-    resp = chat([{"role": "user", "content": prompt}], temperature=0.1, max_tokens=10)
+    resp = chat([{"role": "user", "content": prompt}], temperature=0.1, max_tokens=10,
+                project=project or tenant_scope())
     if resp and not resp.startswith("__LLM_ERROR__"):
         resp = resp.strip().lower()
         allowed = ["payment_received","promise","issue","change","person_change","progress","query","report","diagnose","other"]
