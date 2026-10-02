@@ -1,5 +1,7 @@
 # 工程项目 AI 顾问 · AI Project Advisor
 
+> 🔗 在线体验（官网）：https://yunvela.com/ · 微信扫码即可试用
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org)
 [![Platform](https://img.shields.io/badge/platform-%E4%BC%81%E5%BE%AE%20%7C%20%E9%92%89%E9%92%89%20%7C%20H5-07C160)](README.md)
