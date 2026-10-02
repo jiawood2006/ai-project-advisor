@@ -107,6 +107,15 @@ hermes skills install jiawood2006/hermes-skills/skills/ai-project-advisor
 
 技能源码：<https://github.com/jiawood2006/hermes-skills/tree/main/skills/ai-project-advisor>
 
+## 变更记录
+
+- **2026-10-02 · 单一引擎合并**：原先「企微顾问」与「扫码检验」各自维护一份 `advisor_engine.py`（已分叉）。
+  现合并为一份（本仓库此文件即唯一来源），并修掉 3 个已复现的缺陷：
+  1. 大模型「优先作答」分支排在规则识别之前 —— 有 API key 时收款金额/承诺到期日不落库；
+  2. 建档引导会吞掉业务消息 —— 「收到20万」「答应明天付尾款」被当成建档步骤；
+  3. 函数内重复 `import advisor_llm` 使该名字成为局部变量 —— 未绑定项目时抛 `UnboundLocalError`。
+  测试：`test_advisor.py` 27/27；`test_gateway.py` / `test_masking.py` / `test_onboard.py` 全部通过。
+
 ## 文档
 
 - [产品介绍（客户试用版）](产品介绍_客户试用版.md) · [产品方案书](产品方案书.md) · [使用说明](使用说明.md)
