@@ -1,5 +1,7 @@
 # 工程项目 AI 顾问 · AI Project Advisor
 
+> **Enzo 工程 AI 助手** —— 由 **青岛云境未来文化科技发展有限公司** 开发与运营 · 服务全国（远程交付，不限地域）
+>
 > 🔗 在线体验（官网）：https://yunvela.com/ · 微信扫码即可试用
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -135,6 +137,13 @@ unified multi-platform gateway (WeCom app/bot, DingTalk, H5).
 ---
 
 **如果这个项目对你有用，欢迎点个 ⭐ Star —— 这是我们继续打磨的动力。**
+
+## 关于
+
+- 产品名称：**Enzo 工程 AI 助手**（工程项目 AI 顾问）
+- 开发与运营：青岛云境未来文化科技发展有限公司
+- 服务范围：**全国（远程交付，不限地域）**
+- 官网：https://yunvela.com/ ｜ 联系：enzo@yunvela.com
 
 ## License
 
